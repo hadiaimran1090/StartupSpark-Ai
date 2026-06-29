@@ -1,0 +1,32 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.*
+
+# Streamlit
+.streamlit/
+
+# Data and outputs
+data/raw_pdfs/*
+data/processed/*
+data/chunks/*
+reports/*
+!data/raw_pdfs/.gitkeep
+!data/processed/.gitkeep
+!data/chunks/.gitkeep
+!reports/.gitkeep
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/
