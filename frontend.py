@@ -1,5 +1,9 @@
 import json
 import os
+import re
+import textwrap
+from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -18,6 +22,9 @@ DISPLAY_TO_FOLDER = {
     "Agriculture Tech": "agritech",
     "Cybersecurity": "cybersecurity",
 }
+
+REPORTS_DIR = Path("reports")
+REPORT_HISTORY_FILE = REPORTS_DIR / "report_history.json"
 
 
 def create_supabase_auth_client():
@@ -41,6 +48,136 @@ def user_to_dict(user_obj):
         "user_metadata": getattr(user_obj, "user_metadata", {}) or {},
         "created_at": getattr(user_obj, "created_at", None),
     }
+
+
+def load_report_history():
+    if "report_history" in st.session_state:
+        return st.session_state["report_history"]
+    try:
+        history = json.loads(REPORT_HISTORY_FILE.read_text(encoding="utf-8")) if REPORT_HISTORY_FILE.exists() else []
+    except Exception:
+        history = []
+    st.session_state["report_history"] = history
+    return history
+
+
+def save_report_history(history):
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    REPORT_HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    st.session_state["report_history"] = history
+
+
+def report_title(report):
+    idea = report.get("idea") or {}
+    title = idea.get("startup_name") or "Startup Report"
+    domain = (report.get("metadata") or {}).get("input", {}).get("domain")
+    return f"{title} - {domain}" if domain else title
+
+
+def remember_report(report):
+    history = load_report_history()
+    entry = {
+        "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
+        "created_at": datetime.now().strftime("%b %d, %Y %I:%M %p"),
+        "title": report_title(report),
+        "report": report,
+    }
+    history = [entry] + history
+    save_report_history(history[:12])
+
+
+def safe_filename(value):
+    return re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower() or "startup-report"
+
+
+def report_to_lines(report):
+    idea = report.get("idea") or {}
+    validation = report.get("validation") or {}
+    market = report.get("market_research") or {}
+    business = report.get("business_model") or {}
+    inputs = (report.get("metadata") or {}).get("input") or {}
+    lines = [
+        "StartupSpark AI Strategy Report",
+        report_title(report),
+        f"Generated: {datetime.now().strftime('%B %d, %Y')}",
+        "",
+        "Overview",
+        f"Tagline: {idea.get('tagline') or 'N/A'}",
+        f"Domain: {inputs.get('domain') or 'N/A'}",
+        f"Audience: {inputs.get('target_audience') or 'N/A'}",
+        f"Region: {inputs.get('country_region') or 'N/A'}",
+        f"Budget: {inputs.get('budget') or 'N/A'}",
+        f"Stage: {inputs.get('business_stage') or 'N/A'}",
+        "",
+        "Problem",
+        inputs.get("problem_statement") or "N/A",
+        "",
+        "AI Solution",
+        idea.get("ai_solution") or idea.get("core_idea") or "N/A",
+        "",
+        "Market Research",
+        market.get("summary") or "No market summary available.",
+        "",
+        "Business Model",
+        f"Revenue model: {business.get('revenue_model') or 'TBD'}",
+        f"Pricing: {business.get('pricing') or 'TBD'}",
+        f"Validation score: {validation.get('overall', 'N/A')}/10",
+        "",
+        "MVP Features",
+    ]
+    lines.extend([f"- {item}" for item in report.get("mvp_features", [])] or ["- N/A"])
+    lines.extend(["", "Implementation Roadmap"])
+    lines.extend(
+        [f"- {key.replace('_', ' ').title()}: {value}" for key, value in (report.get("implementation_roadmap") or {}).items()]
+        or ["- N/A"]
+    )
+    lines.extend(["", "Estimated Budget"])
+    lines.extend([f"- {key.title()}: {value}" for key, value in (report.get("estimated_budget") or {}).items()] or ["- N/A"])
+    lines.extend(["", "Future Enhancements"])
+    lines.extend([f"- {item}" for item in report.get("future_enhancements", [])] or ["- N/A"])
+    return lines
+
+
+def escape_pdf_text(text):
+    return str(text).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def make_pdf_bytes(report):
+    wrapped = []
+    for line in report_to_lines(report):
+        wrapped.extend(textwrap.wrap(str(line), width=86) if line else [""])
+    pages = [wrapped[i : i + 42] for i in range(0, len(wrapped), 42)] or [[]]
+    font_id = 3 + len(pages) * 2
+    page_refs = [f"{3 + i * 2} 0 R" for i in range(len(pages))]
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{' '.join(page_refs)}] /Count {len(page_refs)} >>",
+    ]
+    for i, page_lines in enumerate(pages):
+        page_id = 3 + i * 2
+        content_id = page_id + 1
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+        )
+        stream_lines = ["BT", "/F1 11 Tf", "50 744 Td", "14 TL"]
+        for text in page_lines:
+            stream_lines.extend([f"({escape_pdf_text(text)}) Tj", "T*"])
+        stream_lines.append("ET")
+        stream = "\n".join(stream_lines)
+        objects.append(f"<< /Length {len(stream.encode('latin-1', 'replace'))} >>\nstream\n{stream}\nendstream")
+    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{number} 0 obj\n{obj}\nendobj\n".encode("latin-1", "replace"))
+    xref = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("latin-1"))
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("latin-1"))
+    pdf.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode("latin-1"))
+    return bytes(pdf)
 
 
 def inject_styles():
@@ -73,8 +210,8 @@ def inject_styles():
 
             #MainMenu, footer, header { visibility: hidden; }
             .block-container {
-                max-width: 1180px;
-                padding: 1.25rem 1.25rem 3rem;
+                max-width: none;
+                padding: 0 0 3rem;
             }
 
             h1, h2, h3, .brand, .hero-title {
@@ -144,7 +281,7 @@ def inject_styles():
 
             .hero {
                 text-align: center;
-                min-height: 620px;
+                min-height: 400px;
                 display: grid;
                 place-items: center;
                 padding: 3rem 0 2rem;
@@ -393,7 +530,7 @@ def inject_styles():
 
             .stRadio > div {
                 display: grid;
-                grid-template-columns: 1fr 1fr;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
                 gap: .5rem;
                 padding: .45rem;
                 border: 1px solid rgba(173, 198, 255, .14);
@@ -444,10 +581,161 @@ def inject_styles():
                 color: var(--primary);
             }
 
+            .app-topbar {
+                display: grid;
+                grid-template-columns: 430px minmax(0, 1fr) 72px;
+                align-items: center;
+                min-height: 5.2rem;
+                width: 100%;
+                padding: 0 3rem;
+                border-bottom: 1px solid rgba(173, 198, 255, .08);
+                background: #081126;
+            }
+
+            .app-brand {
+                display: flex;
+                align-items: center;
+                gap: .8rem;
+                color: #c8d7ff;
+                font-family: Sora, sans-serif;
+                font-size: 1.6rem;
+                font-weight: 800;
+            }
+
+            .app-brand .mark {
+                color: #adc6ff;
+                font-size: 1.5rem;
+            }
+
+            .app-nav {
+                display: flex;
+                justify-content: center;
+                gap: 3rem;
+                font-family: Sora, sans-serif;
+                font-size: .98rem;
+                font-weight: 800;
+            }
+
+            .app-nav a {
+                color: #d6def5;
+                text-decoration: none;
+            }
+
+            .app-nav a:hover {
+                color: #adc6ff;
+            }
+
+            .app-user-icon {
+                justify-self: end;
+                width: 2.25rem;
+                height: 2.25rem;
+                display: grid;
+                place-items: center;
+                border-radius: 999px;
+                border: 1px solid rgba(214, 222, 245, .35);
+                color: #d6def5;
+                font-weight: 900;
+            }
+
+            div[data-testid="column"]:has(.side-rail) {
+                background: rgba(23, 31, 51, .72);
+                border-right: 1px solid rgba(173, 198, 255, .11);
+            }
+
+            .side-rail {
+                min-height: calc(100vh - 5.2rem);
+                padding: 1.7rem 1.25rem 1rem;
+            }
+
+            .profile-row {
+                display: flex;
+                gap: .9rem;
+                align-items: center;
+                padding: .15rem .35rem 2rem;
+                color: rgba(218, 226, 253, .58);
+                font-size: .86rem;
+            }
+
+            .avatar-dot {
+                width: 3rem;
+                height: 3rem;
+                display: grid;
+                place-items: center;
+                border-radius: 999px;
+                background: rgba(173, 198, 255, .12);
+                color: #adc6ff;
+                font-weight: 900;
+            }
+
+            .forge-main {
+                width: 100%;
+                padding: 0 clamp(1.5rem, 4vw, 4.5rem) 4rem;
+            }
+
+            .forge-hero {
+                margin: 2.2rem 0 2rem;
+            }
+
+            .forge-hero h1 {
+                margin: .8rem 0 .65rem;
+                color: #dce6ff;
+                font-size: clamp(2rem, 3.6vw, 3.2rem);
+                line-height: 1.05;
+                font-weight: 800;
+            }
+
+            .forge-hero p {
+                max-width: 760px;
+                color: #c7cedf;
+                font-size: 1.05rem;
+                line-height: 1.55;
+            }
+
+            div[data-testid="stForm"]:has([data-testid="stFormSubmitButton"]) {
+                padding: clamp(1.7rem, 4vw, 3.1rem);
+                border: 1px solid rgba(173, 198, 255, .16);
+                border-radius: 1.5rem;
+                background: linear-gradient(180deg, rgba(23,31,51,.9), rgba(17,27,50,.9));
+                box-shadow: 0 30px 90px rgba(0, 0, 0, .34);
+            }
+
+            .trust-row {
+                margin-top: 1.6rem;
+                padding-top: 1.5rem;
+                border-top: 1px solid rgba(173, 198, 255, .09);
+            }
+
+            .trust-copy {
+                color: #d9def0;
+                font-size: .82rem;
+            }
+
+            .report-card {
+                padding: 1.2rem;
+                margin: .9rem 0;
+                border: 1px solid rgba(173, 198, 255, .13);
+                border-radius: .9rem;
+                background: rgba(7, 16, 34, .38);
+            }
+
+            .report-card h3 {
+                margin: 0 0 .5rem;
+                color: #dce6ff;
+                font-size: 1.05rem;
+            }
+
+            .report-card p, .report-card li {
+                color: #c2c6d6;
+                line-height: 1.55;
+            }
+
             @media (max-width: 760px) {
                 .navlinks { display: none; }
                 .trait-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
                 .footerline { flex-direction: column; text-align: center; }
+                .app-topbar { grid-template-columns: 1fr 2rem; padding: 0 1rem; }
+                .app-nav, .side-rail { display: none; }
+                .forge-main { padding: 0 1rem 3rem; }
             }
         </style>
         """,
@@ -766,21 +1054,50 @@ def auth_page():
 
 
 def dashboard_page():
-    topbar(show_auth=False)
+    st.session_state.setdefault("dashboard_view", "form")
+    query_view = st.query_params.get("view")
+    if query_view in {"form", "reports", "roadmap"}:
+        st.session_state["dashboard_view"] = "form" if query_view == "form" else "reports"
+
+    history = load_report_history()
     user = st.session_state.get("auth_user") or {}
     name = (user.get("user_metadata") or {}).get("full_name") or user.get("email") or "Founder"
-    left, right = st.columns([0.72, 0.28])
-    with left:
+    st.markdown(
+        """
+        <div class="app-topbar">
+            <div class="app-brand"><span class="mark">&#9889;</span><span>StartupSpark AI</span></div>
+            <div class="app-nav">
+                <a href="?view=form">Form</a>
+                <a href="?view=form">Explore</a>
+                <a href="?view=reports">Reports</a>
+            </div>
+            <div class="app-user-icon">O</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    shell_left, shell_main = st.columns([0.24, 0.76], gap="large")
+    with shell_left:
         st.markdown(
             f"""
-            <div class="eyebrow">Command Center</div>
-            <h1 class="hero-title" style="text-align:left;font-size:clamp(2rem,4vw,3.8rem);margin-left:0;">
-                Build the next startup blueprint, <span class="gradient-text">{name}</span>
-            </h1>
+            <aside class="side-rail">
+                <div class="profile-row">
+                    <div class="avatar-dot">SS</div>
+                    <div><strong>{name}</strong><br>Pro Tier - AI Active</div>
+                </div>
+            </aside>
             """,
             unsafe_allow_html=True,
         )
-    with right:
+        if st.button("Strategy", use_container_width=True, type="primary"):
+            st.session_state["dashboard_view"] = "form"
+            st.query_params["view"] = "form"
+            st.rerun()
+        if st.button("Roadmap", use_container_width=True):
+            st.session_state["dashboard_view"] = "reports"
+            st.query_params["view"] = "reports"
+            st.rerun()
         if st.button("Logout", use_container_width=True):
             try:
                 auth_client = create_supabase_auth_client()
@@ -789,66 +1106,129 @@ def dashboard_page():
             except Exception:
                 pass
             st.session_state.pop("auth_user", None)
+            st.session_state.pop("last_report", None)
             set_page("landing")
             st.rerun()
 
-    with st.form("startup_report_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            domain = st.selectbox("Startup Domain", SUPPORTED_DOMAINS)
-            target_audience = st.text_input("Target Audience", placeholder="Example: small clinic owners")
-            country_region = st.text_input("Country / Region", placeholder="Example: Pakistan, GCC, USA")
-            budget = st.text_input("Budget", placeholder="Example: 10000")
-        with c2:
-            business_stage = st.selectbox("Business Stage", ["Idea", "MVP", "Existing Startup"])
-            problem_statement = st.text_area(
-                "Problem Statement",
-                height=148,
-                placeholder="Describe the customer pain, workflow gap, or market problem.",
+    with shell_main:
+        if st.session_state.get("dashboard_view") == "reports":
+            render_previous_reports(history)
+            return
+
+        if st.session_state.get("dashboard_view") == "report" and st.session_state.get("last_report"):
+            render_report(st.session_state["last_report"])
+            return
+
+        st.markdown(
+            """
+            <main class="forge-main">
+                <div class="forge-hero">
+                    <div class="eyebrow">AI Analysis Engine</div>
+                    <h1>Requirement Forge</h1>
+                    <p>Define your startup's core parameters. Our AI consultants will analyze your inputs to generate a high-velocity strategy roadmap.</p>
+                </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.form("startup_report_form"):
+            c1, c2 = st.columns(2, gap="large")
+            with c1:
+                domain = st.selectbox("Startup Domain", SUPPORTED_DOMAINS, index=0)
+                problem_statement = st.text_area(
+                    "Problem Statement",
+                    height=150,
+                    placeholder="What primary challenge are you solving?",
+                )
+                target_audience = st.text_input("Target Audience", placeholder="e.g. SMBs in Southeast Asia")
+            with c2:
+                country_region = st.text_input("Country / Region", placeholder="Global / Specific Region")
+                budget = st.slider("Available Budget (USD)", 1000, 1000000, 50000, 5000)
+                business_stage = st.radio("Business Stage", ["Idea", "MVP", "Growth"], horizontal=True)
+                additional = st.text_area(
+                    "Additional Requirements",
+                    height=108,
+                    placeholder="Technical constraints, timeline, or specific AI models...",
+                )
+            st.markdown(
+                """
+                <div class="trust-row">
+                    <div class="trust-copy"><span>Secure AI engine with encrypted report processing.</span></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            additional = st.text_area(
-                "Additional Requirements",
-                height=100,
-                placeholder="Mobile app, multilingual, WhatsApp alerts, analytics, etc.",
+            submitted = st.form_submit_button("Initialize Strategy", type="primary", use_container_width=True)
+        st.markdown("</main>", unsafe_allow_html=True)
+
+        if submitted:
+            inputs = {
+                "domain": domain,
+                "domain_key": DISPLAY_TO_FOLDER.get(domain, domain.lower().replace(" ", "_")),
+                "problem_statement": problem_statement,
+                "target_audience": target_audience,
+                "country_region": country_region,
+                "budget": f"${budget:,}",
+                "business_stage": "Existing Startup" if business_stage == "Growth" else business_stage,
+                "additional_requirements": additional,
+                "retriever_query": problem_statement,
+            }
+            with st.spinner("Analyzing concept and forging strategy..."):
+                try:
+                    report = orchestrate_startup(inputs)
+                    st.session_state["last_report"] = report
+                    remember_report(report)
+                    st.session_state["dashboard_view"] = "report"
+                    st.success("Strategy forged. Opening report.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Orchestration failed: {exc}")
+
+
+def render_previous_reports(history):
+    st.markdown(
+        """
+        <main class="forge-main">
+            <div class="forge-hero">
+                <div class="eyebrow">Roadmap Archive</div>
+                <h1>Previous Reports</h1>
+                <p>Review the strategy roadmaps you generated earlier and download any report as a PDF.</p>
+            </div>
+        </main>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not history:
+        st.info("No previous reports yet. Generate a strategy from the Requirement Forge first.")
+        return
+
+    for item in history:
+        report = item.get("report") or {}
+        title = item.get("title") or report_title(report)
+        created_at = item.get("created_at") or "Saved report"
+        st.markdown(
+            f"""
+            <div class="report-card">
+                <h3>{title}</h3>
+                <p>{created_at}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        open_col, download_col = st.columns([0.45, 0.55])
+        with open_col:
+            if st.button("Open Report", key=f"open_{item.get('id')}", use_container_width=True):
+                st.session_state["last_report"] = report
+                st.session_state["dashboard_view"] = "report"
+                st.rerun()
+        with download_col:
+            st.download_button(
+                "Download PDF",
+                make_pdf_bytes(report),
+                file_name=f"{safe_filename(title)}.pdf",
+                mime="application/pdf",
+                key=f"download_{item.get('id')}",
+                use_container_width=True,
             )
-        submitted = st.form_submit_button("Generate Startup Report", type="primary", use_container_width=True)
-
-    if submitted:
-        inputs = {
-            "domain": domain,
-            "domain_key": DISPLAY_TO_FOLDER.get(domain, domain.lower().replace(" ", "_")),
-            "problem_statement": problem_statement,
-            "target_audience": target_audience,
-            "country_region": country_region,
-            "budget": budget,
-            "business_stage": business_stage,
-            "additional_requirements": additional,
-            "retriever_query": problem_statement,
-        }
-        with st.spinner("Running multi-agent startup analysis..."):
-            try:
-                st.session_state["last_report"] = orchestrate_startup(inputs)
-                st.success("Report generated.")
-            except Exception as exc:
-                st.error(f"Orchestration failed: {exc}")
-
-    report = st.session_state.get("last_report")
-    if report:
-        render_report(report)
-
-    with st.expander("Knowledge Base Retrieval"):
-        query = st.text_input("Retriever Query", "patient triage automation in hospitals")
-        top_k = st.slider("Top K", 1, 10, 5)
-        mode = st.radio("Retrieval Mode", ["auto", "rpc", "local"], horizontal=True)
-        domain_key = DISPLAY_TO_FOLDER.get(SUPPORTED_DOMAINS[0], "healthcare_ai")
-        if st.button("Retrieve Context"):
-            with st.spinner("Retrieving context..."):
-                results = query_supabase(query, domain=domain_key, top_k=top_k, mode=mode)
-            st.write(f"Results returned: {len(results) if results else 0}")
-            for score, row in results or []:
-                with st.expander(f"{row.get('source') or row.get('title')} | score: {score}"):
-                    st.write((row.get("text") or "")[:1000])
-
 
 def render_report(report):
     idea = report.get("idea") or {}
@@ -856,24 +1236,45 @@ def render_report(report):
     market = report.get("market_research") or {}
     business = report.get("business_model") or {}
 
-    st.markdown('<h2 class="section-title">Generated Startup Blueprint</h2>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="forge-hero">
+            <div class="eyebrow">Strategy Report</div>
+            <h1>{idea.get("startup_name") or "Generated Startup Blueprint"}</h1>
+            <p>{idea.get("tagline") or "Your AI-generated roadmap is ready for review and export."}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     m1, m2, m3 = st.columns(3)
     m1.metric("Startup", idea.get("startup_name") or "Generated Idea")
     m2.metric("Validation", f"{validation.get('overall', 'N/A')}/10")
     m3.metric("Revenue Model", business.get("revenue_model") or "TBD")
 
-    overview, market_tab, roadmap, export = st.tabs(["Overview", "Market", "Roadmap", "Export"])
+    pdf_name = f"{safe_filename(report_title(report))}.pdf"
+    st.download_button(
+        "Download Report PDF",
+        make_pdf_bytes(report),
+        file_name=pdf_name,
+        mime="application/pdf",
+        type="primary",
+        use_container_width=True,
+    )
+
+    overview, market_tab, roadmap, export = st.tabs(["Overview", "Market", "Roadmap", "Sources"])
     with overview:
-        st.subheader(idea.get("startup_name") or "Startup Overview")
-        st.write(idea.get("tagline") or "")
+        st.markdown('<div class="report-card">', unsafe_allow_html=True)
+        st.subheader("Startup Overview")
         st.write(idea.get("core_idea") or "")
         st.markdown("**AI Solution**")
         st.write(idea.get("ai_solution") or "")
         st.markdown("**MVP Features**")
         for feature in report.get("mvp_features", []):
             st.write(f"- {feature}")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with market_tab:
+        st.markdown('<div class="report-card">', unsafe_allow_html=True)
         st.markdown("**Market Research**")
         st.write(market.get("summary") or "No market summary available.")
         st.markdown("**Competitor Analysis**")
@@ -886,8 +1287,10 @@ def render_report(report):
                 )
         else:
             st.write("No competitors found in current knowledge base sample.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with roadmap:
+        st.markdown('<div class="report-card">', unsafe_allow_html=True)
         st.markdown("**Implementation Roadmap**")
         for phase, detail in (report.get("implementation_roadmap") or {}).items():
             st.write(f"- **{phase.replace('_', ' ').title()}**: {detail}")
@@ -897,18 +1300,21 @@ def render_report(report):
         st.markdown("**Future Enhancements**")
         for enhancement in report.get("future_enhancements", []):
             st.write(f"- {enhancement}")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with export:
+        st.markdown('<div class="report-card">', unsafe_allow_html=True)
+        st.markdown("**Retrieved Sources**")
+        for source in report.get("retrieved_sources", [])[:10]:
+            st.write(f"- {source}")
         st.download_button(
-            "Download Report JSON",
+            "Download Raw JSON",
             json.dumps(report, indent=2),
             file_name="startup_report.json",
             mime="application/json",
             use_container_width=True,
         )
-        st.markdown("**Retrieved Sources**")
-        for source in report.get("retrieved_sources", [])[:10]:
-            st.write(f"- {source}")
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main():
