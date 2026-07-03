@@ -1,4 +1,9 @@
+from frontend import main as _startupspark_frontend_main
+
+_startupspark_frontend_main()
+
 import streamlit as st
+st.stop()
 import os
 from dotenv import load_dotenv
 
