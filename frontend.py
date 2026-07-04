@@ -97,6 +97,11 @@ def esc(value, default="N/A"):
     return html_lib.escape(str(value))
 
 
+def render_html(markup):
+    html = "\n".join(line.strip() for line in textwrap.dedent(markup).strip().splitlines())
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def score_value(value):
     try:
         return float(value)
@@ -767,13 +772,13 @@ def inject_styles():
 
             .stRadio > div {
                 display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
                 gap: .5rem;
                 padding: .45rem;
                 border: 1px solid rgba(173, 198, 255, .14);
                 border-radius: 1rem;
                 background: rgba(19, 27, 46, .9);
-                max-width: 320px;
+                max-width: 460px;
                 margin: 0 auto;
             }
 
@@ -1438,11 +1443,6 @@ def auth_page():
 
     left, center, right = st.columns([0.28, 0.44, 0.28])
     with center:
-        st.markdown(
-            '<div class="auth-brand-large"><span class="bolt">S</span><span>StartupSpark AI</span></div>',
-            unsafe_allow_html=True,
-        )
-
         with st.container():
             selected_mode = st.radio(
                 "Authentication mode",
@@ -1452,6 +1452,11 @@ def auth_page():
                 label_visibility="collapsed",
             )
             st.session_state["auth_mode"] = "signup" if selected_mode == "Sign Up" else "login"
+
+        st.markdown(
+            '<div class="auth-brand-large"><span class="bolt">S</span><span>StartupSpark AI</span></div>',
+            unsafe_allow_html=True,
+        )
 
         if selected_mode == "Login":
             st.markdown(
@@ -1550,8 +1555,9 @@ def dashboard_page():
     history = load_report_history()
     user = st.session_state.get("auth_user") or {}
     name = (user.get("user_metadata") or {}).get("full_name") or user.get("email") or "Founder"
+    avatar_initial = (name.strip()[:1] or "F").upper()
     st.markdown(
-        """
+        f"""
         <div class="app-topbar">
             <div class="app-brand"><span>StartupSpark AI</span></div>
             <div class="app-nav">
@@ -1559,7 +1565,7 @@ def dashboard_page():
                 <a href="?view=form">Explore</a>
                 <a href="?view=reports">Reports</a>
             </div>
-            <div class="app-user-icon">O</div>
+            <div class="app-user-icon">{esc(avatar_initial)}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1572,18 +1578,21 @@ def dashboard_page():
             f"""
             <div class="side-rail">
                 <div class="profile-row">
-                    <div class="avatar-dot">SS</div>
+                    <div class="avatar-dot">{esc(avatar_initial)}</div>
                     <div><strong>{esc(name)}</strong><br>Pro Tier - AI Active</div>
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Strategy", use_container_width=True, type="primary"):
+        current_view = st.session_state.get("dashboard_view")
+        strategy_type = "primary" if current_view in {"form", "report"} else "secondary"
+        roadmap_type = "primary" if current_view == "reports" else "secondary"
+        if st.button("Strategy", use_container_width=True, type=strategy_type):
             st.session_state["dashboard_view"] = "form"
             st.query_params["view"] = "form"
             st.rerun()
-        if st.button("Roadmap", use_container_width=True):
+        if st.button("Roadmap", use_container_width=True, type=roadmap_type):
             st.session_state["dashboard_view"] = "reports"
             st.query_params["view"] = "reports"
             st.rerun()
@@ -1675,7 +1684,7 @@ def dashboard_page():
 
 
 def render_previous_reports(history):
-    st.markdown(
+    render_html(
         """
         <main class="forge-main">
             <div class="forge-hero">
@@ -1684,8 +1693,7 @@ def render_previous_reports(history):
                 <p>Review the strategy roadmaps you generated earlier and download any report as a PDF.</p>
             </div>
         </main>
-        """,
-        unsafe_allow_html=True,
+        """
     )
     if not history:
         st.info("No previous reports yet. Generate a strategy from the Requirement Forge first.")
@@ -1695,16 +1703,15 @@ def render_previous_reports(history):
         report = item.get("report") or {}
         title = item.get("title") or report_title(report)
         created_at = item.get("created_at") or "Saved report"
-        st.markdown(
+        render_html(
             f"""
             <div class="report-card">
                 <h3>{esc(title)}</h3>
                 <p>{esc(created_at)}</p>
             </div>
-            """,
-            unsafe_allow_html=True,
+            """
         )
-        open_col, download_col = st.columns([0.45, 0.55])
+        open_col, download_col, delete_col = st.columns([0.38, 0.38, 0.24])
         with open_col:
             if st.button("Open Report", key=f"open_{item.get('id')}", use_container_width=True):
                 st.session_state["last_report"] = report
@@ -1720,6 +1727,16 @@ def render_previous_reports(history):
                 key=f"download_{item.get('id')}",
                 use_container_width=True,
             )
+        with delete_col:
+            if st.button("Delete", key=f"delete_{item.get('id')}", use_container_width=True):
+                updated_history = [h for h in load_report_history() if h.get("id") != item.get("id")]
+                save_report_history(updated_history)
+                if st.session_state.get("last_report") == report:
+                    st.session_state.pop("last_report", None)
+                    st.session_state["dashboard_view"] = "reports"
+                    st.query_params["view"] = "reports"
+                st.success("Report deleted.")
+                st.rerun()
 
 
 def render_report(report):
@@ -1741,7 +1758,7 @@ def render_report(report):
     tagline = idea.get("tagline") or "Your AI-generated roadmap is ready for review and export."
 
     # ---------- Header ----------
-    st.markdown(
+    render_html(
         f"""
         <div class="forge-main" style="padding-left:0; padding-right:0;">
             <div class="rpt-topline">
@@ -1753,8 +1770,7 @@ def render_report(report):
                 <p>{esc(tagline)}</p>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     back_col, pdf_col, json_col = st.columns([0.5, 0.25, 0.25])
@@ -1791,7 +1807,7 @@ def render_report(report):
     feasibility = validation.get("feasibility")
     overall = validation.get("overall", "N/A")
 
-    st.markdown(
+    render_html(
         f"""
         <div class="bento-grid">
 
@@ -1843,8 +1859,7 @@ def render_report(report):
             </div>
 
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     # ---------- 4/5. Market + Competitors ----------
@@ -1863,7 +1878,7 @@ def render_report(report):
         for c in competitors
     ) or '<tr><td colspan="3" style="color:var(--muted);">No competitors found in current knowledge base sample.</td></tr>'
 
-    st.markdown(
+    render_html(
         f"""
         <div class="bento-grid">
             <div class="glass-panel span-12">
@@ -1895,8 +1910,7 @@ def render_report(report):
                 </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     # ---------- 6. Business Model + 7. MVP Features ----------
@@ -1910,7 +1924,7 @@ def render_report(report):
         for feature in mvp_features
     ) or '<p style="color:var(--muted);">No MVP features generated yet.</p>'
 
-    st.markdown(
+    render_html(
         f"""
         <div class="bento-grid">
             <div class="glass-panel span-5">
@@ -1925,8 +1939,7 @@ def render_report(report):
                 <div class="mvp-grid">{mvp_html}</div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     # ---------- 8. SWOT ----------
@@ -1938,7 +1951,7 @@ def render_report(report):
             return "<li>N/A</li>"
         return "".join(f"<li>{esc(item)}</li>" for item in items)
 
-    st.markdown(
+    render_html(
         f"""
         <div class="bento-grid">
             <div class="glass-panel span-12">
@@ -1963,8 +1976,7 @@ def render_report(report):
                 </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     # ---------- 10. Roadmap + 11. Budget ----------
@@ -2009,7 +2021,7 @@ def render_report(report):
         total_val = sum(v for _, _, v in parsed_budget)
         total_seed = f"${total_val:,.0f}"
 
-    st.markdown(
+    render_html(
         f"""
         <div class="bento-grid">
             <div class="glass-panel span-8">
@@ -2025,8 +2037,7 @@ def render_report(report):
                 </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     # ---------- 12. Future Enhancements + 13. Retrieved Sources ----------
@@ -2039,7 +2050,7 @@ def render_report(report):
         for src in sources[:10]
     ) or '<p style="color:var(--muted);">No sources retrieved.</p>'
 
-    st.markdown(
+    render_html(
         f"""
         <div class="bento-grid">
             <div class="glass-panel span-6">
@@ -2052,8 +2063,7 @@ def render_report(report):
             </div>
         </div>
         <div style="height:2rem;"></div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
