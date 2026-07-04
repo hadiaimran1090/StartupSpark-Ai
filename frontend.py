@@ -1,3 +1,4 @@
+import html as html_lib
 import json
 import os
 import re
@@ -90,93 +91,300 @@ def safe_filename(value):
     return re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower() or "startup-report"
 
 
-def report_to_lines(report):
-    idea = report.get("idea") or {}
-    validation = report.get("validation") or {}
-    market = report.get("market_research") or {}
-    business = report.get("business_model") or {}
-    inputs = (report.get("metadata") or {}).get("input") or {}
-    lines = [
-        "StartupSpark AI Strategy Report",
-        report_title(report),
-        f"Generated: {datetime.now().strftime('%B %d, %Y')}",
-        "",
-        "Overview",
-        f"Tagline: {idea.get('tagline') or 'N/A'}",
-        f"Domain: {inputs.get('domain') or 'N/A'}",
-        f"Audience: {inputs.get('target_audience') or 'N/A'}",
-        f"Region: {inputs.get('country_region') or 'N/A'}",
-        f"Budget: {inputs.get('budget') or 'N/A'}",
-        f"Stage: {inputs.get('business_stage') or 'N/A'}",
-        "",
-        "Problem",
-        inputs.get("problem_statement") or "N/A",
-        "",
-        "AI Solution",
-        idea.get("ai_solution") or idea.get("core_idea") or "N/A",
-        "",
-        "Market Research",
-        market.get("summary") or "No market summary available.",
-        "",
-        "Business Model",
-        f"Revenue model: {business.get('revenue_model') or 'TBD'}",
-        f"Pricing: {business.get('pricing') or 'TBD'}",
-        f"Validation score: {validation.get('overall', 'N/A')}/10",
-        "",
-        "MVP Features",
-    ]
-    lines.extend([f"- {item}" for item in report.get("mvp_features", [])] or ["- N/A"])
-    lines.extend(["", "Implementation Roadmap"])
-    lines.extend(
-        [f"- {key.replace('_', ' ').title()}: {value}" for key, value in (report.get("implementation_roadmap") or {}).items()]
-        or ["- N/A"]
-    )
-    lines.extend(["", "Estimated Budget"])
-    lines.extend([f"- {key.title()}: {value}" for key, value in (report.get("estimated_budget") or {}).items()] or ["- N/A"])
-    lines.extend(["", "Future Enhancements"])
-    lines.extend([f"- {item}" for item in report.get("future_enhancements", [])] or ["- N/A"])
-    return lines
+def esc(value, default="N/A"):
+    if value is None or value == "":
+        return default
+    return html_lib.escape(str(value))
+
+
+def score_value(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def score_pct(value):
+    v = score_value(value)
+    if v is None:
+        return 0
+    return max(0, min(100, v * 10))
 
 
 def escape_pdf_text(text):
     return str(text).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def make_pdf_bytes(report):
-    wrapped = []
-    for line in report_to_lines(report):
-        wrapped.extend(textwrap.wrap(str(line), width=86) if line else [""])
-    pages = [wrapped[i : i + 42] for i in range(0, len(wrapped), 42)] or [[]]
-    font_id = 3 + len(pages) * 2
-    page_refs = [f"{3 + i * 2} 0 R" for i in range(len(pages))]
-    objects = [
-        "<< /Type /Catalog /Pages 2 0 R >>",
-        f"<< /Type /Pages /Kids [{' '.join(page_refs)}] /Count {len(page_refs)} >>",
+# ---------------------------------------------------------------------------
+# Colored / styled PDF export — mirrors the dark "StartupSpark" brand palette
+# used on the report page (no external PDF libraries required).
+# ---------------------------------------------------------------------------
+
+PDF_COLORS = {
+    "bg": (0.043, 0.075, 0.149),        # #0b1326
+    "primary": (0.678, 0.776, 1.0),     # #adc6ff
+    "accent": (1.0, 0.718, 0.525),      # #ffb786
+    "secondary": (0.816, 0.737, 1.0),   # #d0bcff
+    "muted": (0.71, 0.729, 0.808),      # #aeb7cd
+    "text": (0.855, 0.886, 0.992),      # #dae2fd
+    "error": (1.0, 0.706, 0.671),       # soft red tint
+}
+
+PDF_STYLES = {
+    "title":  {"font": "F2", "size": 21, "color": PDF_COLORS["primary"], "leading": 27, "wrap": 44, "indent": 0},
+    "meta":   {"font": "F1", "size": 9.5, "color": PDF_COLORS["muted"], "leading": 13, "wrap": 100, "indent": 0},
+    "h2":     {"font": "F2", "size": 13, "color": PDF_COLORS["accent"], "leading": 23, "wrap": 74, "indent": 0},
+    "kv":     {"font": "F1", "size": 10.5, "color": PDF_COLORS["text"], "leading": 15, "wrap": 90, "indent": 0},
+    "body":   {"font": "F1", "size": 10.5, "color": PDF_COLORS["text"], "leading": 15.5, "wrap": 88, "indent": 0},
+    "item":   {"font": "F1", "size": 10.5, "color": PDF_COLORS["text"], "leading": 15, "wrap": 84, "indent": 16},
+    "spacer": {"leading": 9},
+}
+
+
+def report_to_blocks(report):
+    """Flatten a report dict into (kind, text) blocks used to build the PDF."""
+    idea = report.get("idea") or {}
+    validation = report.get("validation") or {}
+    market = report.get("market_research") or {}
+    business = report.get("business_model") or {}
+    inputs = (report.get("metadata") or {}).get("input") or {}
+    competitors = (report.get("competitor_analysis") or {}).get("competitors", [])
+    swot = report.get("swot_analysis") or {}
+    roadmap = report.get("implementation_roadmap") or {}
+    budget = report.get("estimated_budget") or {}
+    future_enh = report.get("future_enhancements", [])
+    sources = report.get("retrieved_sources", [])
+    mvp_features = report.get("mvp_features", [])
+
+    blocks = [
+        ("title", "StartupSpark AI — Analysis Report"),
+        ("meta", report_title(report)),
+        ("meta", f"Generated: {datetime.now().strftime('%B %d, %Y')}"),
+        ("spacer", ""),
+        ("h2", "1. Startup Overview"),
+        ("kv", f"Name: {idea.get('startup_name') or 'N/A'}"),
+        ("kv", f"Tagline: {idea.get('tagline') or 'N/A'}"),
+        ("kv", f"Domain: {inputs.get('domain') or 'N/A'}"),
+        ("kv", f"Audience: {inputs.get('target_audience') or 'N/A'}"),
+        ("kv", f"Region: {inputs.get('country_region') or 'N/A'}"),
+        ("kv", f"Budget: {inputs.get('budget') or 'N/A'}"),
+        ("kv", f"Stage: {inputs.get('business_stage') or 'N/A'}"),
+        ("spacer", ""),
+        ("h2", "2. Problem Statement"),
+        ("body", inputs.get("problem_statement") or "N/A"),
+        ("spacer", ""),
+        ("h2", "3. Proposed Solution"),
+        ("body", idea.get("ai_solution") or idea.get("core_idea") or "N/A"),
+        ("spacer", ""),
+        ("h2", "4. Market Research"),
+        ("body", market.get("summary") or "No market summary available."),
+        ("spacer", ""),
+        ("h2", "5. Competitor Analysis"),
     ]
-    for i, page_lines in enumerate(pages):
-        page_id = 3 + i * 2
-        content_id = page_id + 1
-        objects.append(
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-            f"/Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+    if competitors:
+        for c in competitors:
+            blocks.append(("item", f"{c.get('name', 'N/A')} — Strength: {c.get('strengths', 'N/A')} | Weakness: {c.get('weaknesses', 'N/A')}"))
+    else:
+        blocks.append(("body", "No competitors found in current knowledge base sample."))
+
+    blocks.extend([
+        ("spacer", ""),
+        ("h2", "6. Business Model"),
+        ("kv", f"Revenue model: {business.get('revenue_model') or 'TBD'}"),
+        ("kv", f"Pricing: {business.get('pricing') or 'TBD'}"),
+        ("kv", f"Segments: {business.get('segments') or 'N/A'}"),
+        ("spacer", ""),
+        ("h2", "7. MVP Features"),
+    ])
+    if mvp_features:
+        for feature in mvp_features:
+            blocks.append(("item", feature))
+    else:
+        blocks.append(("body", "N/A"))
+
+    blocks.extend([("spacer", ""), ("h2", "8. SWOT Analysis")])
+    for label, key in [("Strengths", "strengths"), ("Weaknesses", "weaknesses"), ("Opportunities", "opportunities"), ("Threats", "threats")]:
+        values = swot.get(key)
+        if isinstance(values, str):
+            values = [values]
+        blocks.append(("kv", f"{label}:"))
+        if values:
+            for value in values:
+                blocks.append(("item", value))
+        else:
+            blocks.append(("item", "N/A"))
+
+    blocks.extend([
+        ("spacer", ""),
+        ("h2", "9. Validation Score"),
+        ("kv", f"Innovation: {validation.get('innovation', 'N/A')}"),
+        ("kv", f"Market Demand: {validation.get('market_demand', 'N/A')}"),
+        ("kv", f"Feasibility: {validation.get('feasibility', 'N/A')}"),
+        ("kv", f"Overall Spark Score: {validation.get('overall', 'N/A')}/10"),
+        ("spacer", ""),
+        ("h2", "10. Implementation Roadmap"),
+    ])
+    if roadmap:
+        for key, value in roadmap.items():
+            blocks.append(("item", f"{key.replace('_', ' ').title()}: {value}"))
+    else:
+        blocks.append(("body", "N/A"))
+
+    blocks.extend([("spacer", ""), ("h2", "11. Estimated Budget")])
+    if budget:
+        for key, value in budget.items():
+            blocks.append(("item", f"{key.title()}: {value}"))
+    else:
+        blocks.append(("body", "N/A"))
+
+    blocks.extend([("spacer", ""), ("h2", "12. Future Enhancements")])
+    if future_enh:
+        for item in future_enh:
+            blocks.append(("item", item))
+    else:
+        blocks.append(("body", "N/A"))
+
+    blocks.extend([("spacer", ""), ("h2", "13. Retrieved Sources")])
+    if sources:
+        for source in sources[:10]:
+            blocks.append(("item", source))
+    else:
+        blocks.append(("body", "No sources retrieved."))
+
+    return blocks
+
+
+def _wrap_pdf_text(text, width):
+    text = str(text)
+    if not text:
+        return [""]
+    return textwrap.wrap(text, width=width) or [""]
+
+
+def _paginate_pdf_blocks(blocks):
+    page_w, page_h = 612, 792
+    margin_x = 50
+    top_y = 738
+    bottom_y = 60
+
+    pages = []
+    current_page = []
+    y = top_y
+
+    def start_new_page():
+        nonlocal current_page, y
+        pages.append(current_page)
+        current_page = []
+        y = top_y
+
+    for kind, text in blocks:
+        style = PDF_STYLES[kind]
+        leading = style["leading"]
+        if kind == "spacer":
+            y -= leading
+            if y < bottom_y:
+                start_new_page()
+            continue
+
+        bullet = "•  " if kind == "item" else ""
+        lines = _wrap_pdf_text(text, style["wrap"])
+        for i, line in enumerate(lines):
+            if y < bottom_y:
+                start_new_page()
+            display_text = (bullet + line) if i == 0 else (("   " if kind == "item" else "") + line)
+            current_page.append(
+                {
+                    "x": margin_x + style["indent"],
+                    "y": y,
+                    "font": style["font"],
+                    "size": style["size"],
+                    "color": style["color"],
+                    "text": display_text,
+                }
+            )
+            y -= leading
+
+    if current_page or not pages:
+        pages.append(current_page)
+    return pages, page_w, page_h
+
+
+def make_pdf_bytes(report):
+    blocks = report_to_blocks(report)
+    pages, page_w, page_h = _paginate_pdf_blocks(blocks)
+    num_pages = len(pages)
+
+    page_obj_ids, content_obj_ids = [], []
+    next_id = 3
+    for _ in range(num_pages):
+        page_obj_ids.append(next_id)
+        next_id += 1
+        content_obj_ids.append(next_id)
+        next_id += 1
+    font1_id, font2_id = next_id, next_id + 1
+
+    objects = {
+        1: "<< /Type /Catalog /Pages 2 0 R >>",
+        2: f"<< /Type /Pages /Kids [{' '.join(f'{pid} 0 R' for pid in page_obj_ids)}] /Count {num_pages} >>",
+    }
+
+    bg = PDF_COLORS["bg"]
+    for i in range(num_pages):
+        page_id, content_id = page_obj_ids[i], content_obj_ids[i]
+        objects[page_id] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w} {page_h}] "
+            f"/Resources << /Font << /F1 {font1_id} 0 R /F2 {font2_id} 0 R >> >> "
+            f"/Contents {content_id} 0 R >>"
         )
-        stream_lines = ["BT", "/F1 11 Tf", "50 744 Td", "14 TL"]
-        for text in page_lines:
-            stream_lines.extend([f"({escape_pdf_text(text)}) Tj", "T*"])
-        stream_lines.append("ET")
-        stream = "\n".join(stream_lines)
-        objects.append(f"<< /Length {len(stream.encode('latin-1', 'replace'))} >>\nstream\n{stream}\nendstream")
-    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+        stream_parts = [
+            f"{bg[0]:.3f} {bg[1]:.3f} {bg[2]:.3f} rg",
+            f"0 0 {page_w} {page_h} re f",
+        ]
+        for item in pages[i]:
+            r, g, b = item["color"]
+            stream_parts.extend(
+                [
+                    "BT",
+                    f"/{item['font']} {item['size']:.1f} Tf",
+                    f"{r:.3f} {g:.3f} {b:.3f} rg",
+                    f"1 0 0 1 {item['x']:.1f} {item['y']:.1f} Tm",
+                    f"({escape_pdf_text(item['text'])}) Tj",
+                    "ET",
+                ]
+            )
+        muted = PDF_COLORS["muted"]
+        stream_parts.extend(
+            [
+                "BT",
+                "/F1 8 Tf",
+                f"{muted[0]:.3f} {muted[1]:.3f} {muted[2]:.3f} rg",
+                f"1 0 0 1 {page_w - 110} 28 Tm",
+                f"(Page {i + 1} of {num_pages}) Tj",
+                "ET",
+            ]
+        )
+        stream = "\n".join(stream_parts)
+        objects[content_id] = f"<< /Length {len(stream.encode('latin-1', 'replace'))} >>\nstream\n{stream}\nendstream"
+
+    objects[font1_id] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    objects[font2_id] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"
+
+    max_obj = font2_id
     pdf = bytearray(b"%PDF-1.4\n")
-    offsets = [0]
-    for number, obj in enumerate(objects, start=1):
-        offsets.append(len(pdf))
-        pdf.extend(f"{number} 0 obj\n{obj}\nendobj\n".encode("latin-1", "replace"))
-    xref = len(pdf)
-    pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("latin-1"))
-    for offset in offsets[1:]:
-        pdf.extend(f"{offset:010d} 00000 n \n".encode("latin-1"))
-    pdf.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode("latin-1"))
+    offsets = [0] * (max_obj + 1)
+    for number in range(1, max_obj + 1):
+        obj_str = objects.get(number)
+        if obj_str is None:
+            continue
+        offsets[number] = len(pdf)
+        pdf.extend(f"{number} 0 obj\n{obj_str}\nendobj\n".encode("latin-1", "replace"))
+
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {max_obj + 1}\n0000000000 65535 f \n".encode("latin-1"))
+    for number in range(1, max_obj + 1):
+        pdf.extend(f"{offsets[number]:010d} 00000 n \n".encode("latin-1"))
+    pdf.extend(f"trailer\n<< /Size {max_obj + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode("latin-1"))
     return bytes(pdf)
 
 
@@ -211,7 +419,7 @@ def inject_styles():
             #MainMenu, footer, header { visibility: hidden; }
             .block-container {
                 max-width: none;
-                padding: 0 0 3rem;
+                padding: 0 3rem 3rem;
             }
 
             h1, h2, h3, .brand, .hero-title {
@@ -250,7 +458,7 @@ def inject_styles():
                 justify-content: center;
                 gap: 2rem;
                 color: var(--muted);
-                font-size: .78rem;
+                font-size: 1rem;
                 font-weight: 700;
             }
 
@@ -357,6 +565,7 @@ def inject_styles():
             .glass-card {
                 min-height: 245px;
                 padding: 1.65rem;
+                margin-top: 20px;
             }
 
             .glass-card h3, .metric-card h3 {
@@ -443,7 +652,7 @@ def inject_styles():
                 margin: .8rem auto 2rem;
                 color: var(--primary);
                 font-family: Sora, sans-serif;
-                font-size: clamp(2rem, 4vw, 3.25rem);
+                font-size: clamp(1.5rem, 6vw, 3rem);
                 font-weight: 800;
             }
 
@@ -465,10 +674,21 @@ def inject_styles():
                 box-shadow: 0 28px 90px rgba(0, 0, 0, .32);
             }
 
+            .auth-back-button .stButton button {
+                color: #4d8eff !important;
+                border: none !important;
+            }
+
+            div[data-testid="stForm"]:has(button[kind="primary"]) {
+                max-width: 480px;
+                margin-left: auto;
+                margin-right: auto;
+            }
+
             .auth-title {
                 text-align: center;
                 margin: 2rem 0 .7rem;
-                font-size: clamp(2.2rem, 7vw, 4rem);
+                font-size: clamp(1.5rem, 6vw, 3rem);
                 line-height: 1.05;
                 font-weight: 800;
                 color: #e6ecff;
@@ -530,14 +750,20 @@ def inject_styles():
 
             .stRadio > div {
                 display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
+                grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: .5rem;
                 padding: .45rem;
                 border: 1px solid rgba(173, 198, 255, .14);
                 border-radius: 1rem;
                 background: rgba(19, 27, 46, .9);
-                max-width: 360px;
+                max-width: 320px;
                 margin: 0 auto;
+            }
+
+            div[data-testid="stRadio"] {
+                display: flex;
+                justify-content: center;
+                width: 100%;
             }
 
             .stRadio [role="radio"] {
@@ -585,12 +811,10 @@ def inject_styles():
                 display: grid;
                 grid-template-columns: 430px minmax(0, 1fr) 72px;
                 align-items: center;
-                min-height: 5.2rem;
+                min-height: 4.8rem;
                 width: 100%;
                 padding: 0 3rem;
-                border-bottom: 1px solid rgba(173, 198, 255, .08);
-                background: #081126;
-            }
+                border-bottom: 1px solid rgba(173, 198, 255, .08);            }
 
             .app-brand {
                 display: flex;
@@ -598,7 +822,7 @@ def inject_styles():
                 gap: .8rem;
                 color: #c8d7ff;
                 font-family: Sora, sans-serif;
-                font-size: 1.6rem;
+                font-size: 1.4rem;
                 font-weight: 800;
             }
 
@@ -612,7 +836,7 @@ def inject_styles():
                 justify-content: center;
                 gap: 3rem;
                 font-family: Sora, sans-serif;
-                font-size: .98rem;
+                font-size: 1.2rem;
                 font-weight: 800;
             }
 
@@ -637,21 +861,24 @@ def inject_styles():
                 font-weight: 900;
             }
 
+            /* ---- Side rail: fixed so the nav buttons sit right under the
+                   profile row instead of being pushed to the bottom ---- */
             div[data-testid="column"]:has(.side-rail) {
                 background: rgba(23, 31, 51, .72);
                 border-right: 1px solid rgba(173, 198, 255, .11);
             }
 
             .side-rail {
-                min-height: calc(100vh - 5.2rem);
-                padding: 1.7rem 1.25rem 1rem;
+                min-height: auto;
+                padding: 1.7rem 1.25rem 0;
+                background: rgba(23, 31, 51, .72);
             }
 
             .profile-row {
                 display: flex;
                 gap: .9rem;
                 align-items: center;
-                padding: .15rem .35rem 2rem;
+                padding: .15rem .35rem 1.4rem;
                 color: rgba(218, 226, 253, .58);
                 font-size: .86rem;
             }
@@ -679,7 +906,7 @@ def inject_styles():
             .forge-hero h1 {
                 margin: .8rem 0 .65rem;
                 color: #dce6ff;
-                font-size: clamp(2rem, 3.6vw, 3.2rem);
+                font-size: clamp(1.5rem, 3vw, 3rem);
                 line-height: 1.05;
                 font-weight: 800;
             }
@@ -729,6 +956,275 @@ def inject_styles():
                 line-height: 1.55;
             }
 
+            /* =========================================================
+               Analysis Report page (bento-grid style)
+               ========================================================= */
+            .rpt-topline {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: .5rem;
+                color: var(--muted);
+                font-size: .78rem;
+                margin-bottom: .4rem;
+            }
+            .rpt-topline .current { color: var(--primary); font-weight: 700; }
+
+            .rpt-hero h1 {
+                margin: .3rem 0 .5rem;
+                font-size: clamp(1.9rem, 3.4vw, 2.6rem);
+                font-weight: 800;
+                color: #eef3ff;
+            }
+            .rpt-hero h1 span { color: var(--primary); }
+            .rpt-hero p {
+                color: var(--muted);
+                font-size: 1.02rem;
+                max-width: 760px;
+            }
+
+            .bento-grid {
+                display: grid;
+                grid-template-columns: repeat(12, minmax(0, 1fr));
+                gap: 1.4rem;
+                margin-top: 1.5rem;
+            }
+            .span-12 { grid-column: span 12; }
+            .span-8 { grid-column: span 8; }
+            .span-7 { grid-column: span 7; }
+            .span-6 { grid-column: span 6; }
+            .span-5 { grid-column: span 5; }
+            .span-4 { grid-column: span 4; }
+
+            .glass-panel {
+                background: rgba(23, 31, 51, .68);
+                border: 1px solid rgba(173, 198, 255, .12);
+                border-radius: 1.5rem;
+                padding: 1.75rem;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, .30);
+            }
+
+            .panel-head {
+                display: flex;
+                align-items: center;
+                gap: .6rem;
+                margin-bottom: 1.2rem;
+                font-weight: 800;
+                font-size: 1.1rem;
+                color: #eef3ff;
+            }
+            .panel-head .ic {
+                font-size: 1.15rem;
+                color: var(--primary);
+            }
+
+            .field-label {
+                font-size: .66rem;
+                letter-spacing: .08em;
+                text-transform: uppercase;
+                color: var(--muted);
+                margin-bottom: .3rem;
+            }
+            .field-value {
+                color: #eef3ff;
+                font-size: .96rem;
+                line-height: 1.55;
+                margin-bottom: 1.1rem;
+            }
+
+            .chip-row { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
+            .chip {
+                padding: .3rem .75rem;
+                border-radius: 999px;
+                font-size: .7rem;
+                font-weight: 700;
+                border: 1px solid rgba(173, 198, 255, .28);
+                background: rgba(173, 198, 255, .08);
+                color: var(--primary);
+            }
+
+            .validation-row {
+                display: flex;
+                justify-content: space-between;
+                font-size: .84rem;
+                color: var(--muted);
+                margin-bottom: .35rem;
+            }
+            .validation-row strong { color: #eef3ff; font-size: 1.05rem; }
+            .bar-track {
+                height: 6px;
+                border-radius: 999px;
+                background: rgba(255, 255, 255, .08);
+                overflow: hidden;
+                margin-bottom: 1.1rem;
+            }
+            .bar-fill { height: 100%; border-radius: 999px; background: var(--primary); }
+
+            .spark-score {
+                text-align: center;
+                margin-top: .5rem;
+                padding-top: 1.2rem;
+                border-top: 1px solid rgba(173, 198, 255, .14);
+            }
+            .spark-score .label {
+                font-size: .66rem;
+                text-transform: uppercase;
+                letter-spacing: .1em;
+                color: var(--muted);
+            }
+            .spark-score .value {
+                font-size: 2.3rem;
+                font-weight: 800;
+                color: var(--primary);
+                line-height: 1.3;
+            }
+
+            .tint-box {
+                padding: 1.15rem;
+                border-radius: 1rem;
+                line-height: 1.65;
+                font-size: .92rem;
+            }
+            .tint-error {
+                background: rgba(255, 128, 128, .08);
+                border: 1px solid rgba(255, 128, 128, .22);
+                color: #ffd9d5;
+            }
+            .tint-primary {
+                background: rgba(173, 198, 255, .08);
+                border: 1px solid rgba(173, 198, 255, .22);
+                color: #dbe6ff;
+            }
+
+            .stat-mini {
+                text-align: center;
+                padding: 1.2rem;
+                border-radius: 1.1rem;
+                background: rgba(45, 52, 73, .42);
+                border: 1px solid rgba(173, 198, 255, .08);
+            }
+            .stat-mini .num { font-size: 1.7rem; font-weight: 800; }
+            .stat-mini .cap { font-size: .7rem; color: var(--muted); margin-top: .3rem; }
+
+            .comp-table { width: 100%; border-collapse: collapse; margin-top: .4rem; }
+            .comp-table th {
+                text-align: left;
+                font-size: .66rem;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: .06em;
+                padding: .55rem 0;
+                border-bottom: 1px solid rgba(173, 198, 255, .16);
+            }
+            .comp-table td {
+                padding: .6rem 0;
+                border-bottom: 1px solid rgba(173, 198, 255, .06);
+                font-size: .88rem;
+                color: #dce4fb;
+            }
+
+            .mvp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+            .mvp-item {
+                display: flex;
+                gap: .7rem;
+                align-items: flex-start;
+                padding: 1rem;
+                border-radius: 1rem;
+                background: rgba(45, 52, 73, .4);
+                border: 1px solid rgba(173, 198, 255, .06);
+            }
+            .mvp-item .ic { color: var(--accent); font-size: 1.15rem; }
+            .mvp-item h5 { margin: 0 0 .2rem; color: #eef3ff; font-size: .92rem; }
+            .mvp-item p { margin: 0; font-size: .78rem; color: var(--muted); }
+
+            .swot-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
+            .swot-card { padding: 1.2rem; border-radius: 1.25rem; }
+            .swot-card h5 {
+                margin: 0 0 .6rem;
+                font-weight: 800;
+                display: flex;
+                gap: .4rem;
+                align-items: center;
+                font-size: .95rem;
+            }
+            .swot-card ul { margin: 0; padding-left: 1.1rem; color: var(--muted); font-size: .8rem; line-height: 1.65; }
+            .swot-strength { background: rgba(173, 198, 255, .06); border: 1px solid rgba(173, 198, 255, .2); }
+            .swot-strength h5 { color: var(--primary); }
+            .swot-weak { background: rgba(255, 183, 134, .06); border: 1px solid rgba(255, 183, 134, .2); }
+            .swot-weak h5 { color: var(--accent); }
+            .swot-opp { background: rgba(208, 188, 255, .06); border: 1px solid rgba(208, 188, 255, .2); }
+            .swot-opp h5 { color: var(--secondary); }
+            .swot-threat { background: rgba(255, 128, 128, .06); border: 1px solid rgba(255, 128, 128, .2); }
+            .swot-threat h5 { color: #ff9d95; }
+
+            .timeline { position: relative; padding-left: 2rem; }
+            .timeline::before {
+                content: '';
+                position: absolute;
+                left: .58rem;
+                top: .4rem;
+                bottom: .4rem;
+                width: 2px;
+                background: rgba(173, 198, 255, .2);
+            }
+            .tl-item { position: relative; margin-bottom: 1.7rem; }
+            .tl-item:last-child { margin-bottom: 0; }
+            .tl-dot {
+                position: absolute;
+                left: -2rem;
+                top: .18rem;
+                width: .85rem;
+                height: .85rem;
+                border-radius: 999px;
+                background: var(--primary);
+                box-shadow: 0 0 0 4px rgba(173, 198, 255, .18);
+            }
+            .tl-item.done .tl-dot { background: var(--muted); box-shadow: 0 0 0 4px rgba(174, 183, 205, .12); }
+            .tl-item h5 { margin: 0 0 .3rem; color: #eef3ff; font-size: .96rem; }
+            .tl-item p { margin: 0; color: var(--muted); font-size: .86rem; line-height: 1.5; }
+
+            .budget-row { display: flex; justify-content: space-between; font-size: .84rem; margin-bottom: .3rem; color: var(--muted); }
+            .budget-row strong { color: #eef3ff; }
+            .budget-total {
+                text-align: center;
+                margin-top: 1.1rem;
+                padding-top: 1.1rem;
+                border-top: 1px solid rgba(173, 198, 255, .14);
+            }
+            .budget-total .label { font-size: .66rem; text-transform: uppercase; color: var(--muted); letter-spacing: .08em; }
+            .budget-total .value { font-size: 1.8rem; font-weight: 800; color: var(--primary); }
+
+            .enh-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .9rem; }
+            .enh-item {
+                display: flex;
+                align-items: center;
+                gap: .6rem;
+                padding: .9rem 1rem;
+                border-radius: 1rem;
+                background: rgba(45, 52, 73, .4);
+                border: 1px solid rgba(173, 198, 255, .06);
+                font-size: .86rem;
+                color: #dce4fb;
+            }
+
+            .source-item {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: .7rem .9rem;
+                border-radius: .8rem;
+                background: rgba(45, 52, 73, .35);
+                margin-bottom: .5rem;
+                font-size: .8rem;
+                color: var(--muted);
+            }
+
+            @media (max-width: 900px) {
+                .bento-grid [class*="span-"] { grid-column: span 12; }
+                .mvp-grid, .enh-grid { grid-template-columns: 1fr; }
+                .swot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            }
+
             @media (max-width: 760px) {
                 .navlinks { display: none; }
                 .trait-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -736,6 +1232,7 @@ def inject_styles():
                 .app-topbar { grid-template-columns: 1fr 2rem; padding: 0 1rem; }
                 .app-nav, .side-rail { display: none; }
                 .forge-main { padding: 0 1rem 3rem; }
+                .swot-grid { grid-template-columns: 1fr; }
             }
         </style>
         """,
@@ -916,9 +1413,11 @@ def landing_page():
 
 def auth_page():
     topbar(show_auth=False)
-    if st.button("←", key="auth_back", help="Back to landing"):
+    st.markdown('<div class="auth-back-button">', unsafe_allow_html=True)
+    if st.button("←", key="auth_back"):
         set_page("landing")
         st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
     left, center, right = st.columns([0.28, 0.44, 0.28])
     with center:
@@ -926,15 +1425,16 @@ def auth_page():
             '<div class="auth-brand-large"><span class="bolt">S</span><span>StartupSpark AI</span></div>',
             unsafe_allow_html=True,
         )
-        
-        selected_mode = st.radio(
-            "Authentication mode",
-            ["Login", "Sign Up"],
-            index=1 if st.session_state.get("auth_mode") == "signup" else 0,
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-        st.session_state["auth_mode"] = "signup" if selected_mode == "Sign Up" else "login"
+
+        with st.container():
+            selected_mode = st.radio(
+                "Authentication mode",
+                ["Login", "Sign Up"],
+                index=1 if st.session_state.get("auth_mode") == "signup" else 0,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            st.session_state["auth_mode"] = "signup" if selected_mode == "Sign Up" else "login"
 
         if selected_mode == "Login":
             st.markdown(
@@ -1016,48 +1516,19 @@ def auth_page():
                     except Exception as exc:
                         st.error(f"Account creation failed: {exc}")
 
-        st.markdown(
-            """
-            <div style="display:flex;align-items:center;gap:1rem;margin:1.5rem 0;color:#aeb7cd;">
-                <div style="height:1px;background:rgba(173,198,255,.16);flex:1;"></div>
-                <span>Or continue with</span>
-                <div style="height:1px;background:rgba(173,198,255,.16);flex:1;"></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        social_a, social_b = st.columns(2)
-        with social_a:
-            if st.button("Google", use_container_width=True):
-                try:
-                    auth_client = create_supabase_auth_client()
-                    if not auth_client:
-                        st.error("Supabase credentials are missing in .env")
-                    else:
-                        oauth_res = auth_client.auth.sign_in_with_oauth(
-                            {
-                                "provider": "google",
-                                "options": {"redirect_to": "http://localhost:8501"},
-                            }
-                        )
-                        oauth_url = getattr(oauth_res, "url", None)
-                        if not oauth_url and isinstance(oauth_res, dict):
-                            oauth_url = oauth_res.get("url")
-                        if oauth_url:
-                            st.link_button("Continue with Google", oauth_url, use_container_width=True)
-                        else:
-                            st.info("Google OAuth request started. Complete it in the browser if Supabase opens the provider page.")
-                except Exception as exc:
-                    st.error(f"Google login failed: {exc}")
-        with social_b:
-            st.button("GitHub", use_container_width=True, disabled=True)
-
 
 def dashboard_page():
     st.session_state.setdefault("dashboard_view", "form")
+    # Sync from the URL only for values the top-nav <a> links actually use.
+    # "report" is handled separately below and is never clobbered here,
+    # so generating/opening a report always lands on the report page.
     query_view = st.query_params.get("view")
-    if query_view in {"form", "reports", "roadmap"}:
-        st.session_state["dashboard_view"] = "form" if query_view == "form" else "reports"
+    if query_view == "form":
+        st.session_state["dashboard_view"] = "form"
+    elif query_view in {"reports", "roadmap"}:
+        st.session_state["dashboard_view"] = "reports"
+    elif query_view == "report" and st.session_state.get("last_report"):
+        st.session_state["dashboard_view"] = "report"
 
     history = load_report_history()
     user = st.session_state.get("auth_user") or {}
@@ -1065,7 +1536,7 @@ def dashboard_page():
     st.markdown(
         """
         <div class="app-topbar">
-            <div class="app-brand"><span class="mark">&#9889;</span><span>StartupSpark AI</span></div>
+            <div class="app-brand"><span>StartupSpark AI</span></div>
             <div class="app-nav">
                 <a href="?view=form">Form</a>
                 <a href="?view=form">Explore</a>
@@ -1079,14 +1550,15 @@ def dashboard_page():
 
     shell_left, shell_main = st.columns([0.24, 0.76], gap="large")
     with shell_left:
+        # Profile row + nav buttons rendered together at the TOP of the rail.
         st.markdown(
             f"""
-            <aside class="side-rail">
+            <div class="side-rail">
                 <div class="profile-row">
                     <div class="avatar-dot">SS</div>
-                    <div><strong>{name}</strong><br>Pro Tier - AI Active</div>
+                    <div><strong>{esc(name)}</strong><br>Pro Tier - AI Active</div>
                 </div>
-            </aside>
+            </div>
             """,
             unsafe_allow_html=True,
         )
@@ -1178,6 +1650,7 @@ def dashboard_page():
                     st.session_state["last_report"] = report
                     remember_report(report)
                     st.session_state["dashboard_view"] = "report"
+                    st.query_params["view"] = "report"
                     st.success("Strategy forged. Opening report.")
                     st.rerun()
                 except Exception as exc:
@@ -1208,8 +1681,8 @@ def render_previous_reports(history):
         st.markdown(
             f"""
             <div class="report-card">
-                <h3>{title}</h3>
-                <p>{created_at}</p>
+                <h3>{esc(title)}</h3>
+                <p>{esc(created_at)}</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1219,6 +1692,7 @@ def render_previous_reports(history):
             if st.button("Open Report", key=f"open_{item.get('id')}", use_container_width=True):
                 st.session_state["last_report"] = report
                 st.session_state["dashboard_view"] = "report"
+                st.query_params["view"] = "report"
                 st.rerun()
         with download_col:
             st.download_button(
@@ -1230,91 +1704,340 @@ def render_previous_reports(history):
                 use_container_width=True,
             )
 
+
 def render_report(report):
     idea = report.get("idea") or {}
     validation = report.get("validation") or {}
     market = report.get("market_research") or {}
     business = report.get("business_model") or {}
+    competitor_data = report.get("competitor_analysis") or {}
+    competitors = competitor_data.get("competitors", [])
+    mvp_features = report.get("mvp_features", [])
+    swot = report.get("swot_analysis") or {}
+    roadmap = report.get("implementation_roadmap") or {}
+    budget = report.get("estimated_budget") or {}
+    future_enh = report.get("future_enhancements", [])
+    sources = report.get("retrieved_sources", [])
+    inputs = (report.get("metadata") or {}).get("input") or {}
 
+    startup_name = idea.get("startup_name") or "Generated Startup Blueprint"
+    tagline = idea.get("tagline") or "Your AI-generated roadmap is ready for review and export."
+
+    # ---------- Header ----------
     st.markdown(
         f"""
-        <div class="forge-hero">
-            <div class="eyebrow">Strategy Report</div>
-            <h1>{idea.get("startup_name") or "Generated Startup Blueprint"}</h1>
-            <p>{idea.get("tagline") or "Your AI-generated roadmap is ready for review and export."}</p>
+        <div class="forge-main" style="padding-left:0; padding-right:0;">
+            <div class="rpt-topline">
+                <span>Analytics</span><span>›</span>
+                <span class="current">{esc(startup_name)}</span>
+            </div>
+            <div class="rpt-hero">
+                <h1>Analysis Report: <span>{esc(startup_name)}</span></h1>
+                <p>{esc(tagline)}</p>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Startup", idea.get("startup_name") or "Generated Idea")
-    m2.metric("Validation", f"{validation.get('overall', 'N/A')}/10")
-    m3.metric("Revenue Model", business.get("revenue_model") or "TBD")
 
-    pdf_name = f"{safe_filename(report_title(report))}.pdf"
-    st.download_button(
-        "Download Report PDF",
-        make_pdf_bytes(report),
-        file_name=pdf_name,
-        mime="application/pdf",
-        type="primary",
-        use_container_width=True,
-    )
-
-    overview, market_tab, roadmap, export = st.tabs(["Overview", "Market", "Roadmap", "Sources"])
-    with overview:
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.subheader("Startup Overview")
-        st.write(idea.get("core_idea") or "")
-        st.markdown("**AI Solution**")
-        st.write(idea.get("ai_solution") or "")
-        st.markdown("**MVP Features**")
-        for feature in report.get("mvp_features", []):
-            st.write(f"- {feature}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with market_tab:
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.markdown("**Market Research**")
-        st.write(market.get("summary") or "No market summary available.")
-        st.markdown("**Competitor Analysis**")
-        competitors = (report.get("competitor_analysis") or {}).get("competitors", [])
-        if competitors:
-            for competitor in competitors:
-                st.write(
-                    f"- **{competitor.get('name')}** | Strengths: {competitor.get('strengths')} | "
-                    f"Weaknesses: {competitor.get('weaknesses')}"
-                )
-        else:
-            st.write("No competitors found in current knowledge base sample.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with roadmap:
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.markdown("**Implementation Roadmap**")
-        for phase, detail in (report.get("implementation_roadmap") or {}).items():
-            st.write(f"- **{phase.replace('_', ' ').title()}**: {detail}")
-        st.markdown("**Estimated Budget**")
-        for key, value in (report.get("estimated_budget") or {}).items():
-            st.write(f"- **{key.title()}**: {value}")
-        st.markdown("**Future Enhancements**")
-        for enhancement in report.get("future_enhancements", []):
-            st.write(f"- {enhancement}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with export:
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.markdown("**Retrieved Sources**")
-        for source in report.get("retrieved_sources", [])[:10]:
-            st.write(f"- {source}")
+    back_col, pdf_col, json_col = st.columns([0.5, 0.25, 0.25])
+    with back_col:
+        if st.button("← Back to Requirement Forge", use_container_width=True):
+            st.session_state["dashboard_view"] = "form"
+            st.query_params["view"] = "form"
+            st.rerun()
+    with pdf_col:
         st.download_button(
-            "Download Raw JSON",
+            "Export PDF",
+            make_pdf_bytes(report),
+            file_name=f"{safe_filename(report_title(report))}.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+        )
+    with json_col:
+        st.download_button(
+            "Export JSON",
             json.dumps(report, indent=2),
-            file_name="startup_report.json",
+            file_name=f"{safe_filename(report_title(report))}.json",
             mime="application/json",
             use_container_width=True,
         )
-        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------- 1. Overview + 9. Validation ----------
+    domain_audience = " / ".join(
+        [v for v in [inputs.get("domain"), inputs.get("target_audience")] if v]
+    ) or "N/A"
+
+    innovation = validation.get("innovation")
+    market_demand = validation.get("market_demand")
+    feasibility = validation.get("feasibility")
+    overall = validation.get("overall", "N/A")
+
+    st.markdown(
+        f"""
+        <div class="bento-grid">
+
+            <div class="glass-panel span-8">
+                <div class="panel-head"><span class="ic">ⓘ</span> 1. Startup Overview</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:2rem;">
+                    <div>
+                        <div class="field-label">Name</div>
+                        <div class="field-value" style="color:var(--primary); font-weight:800; font-size:1.15rem;">{esc(startup_name)}</div>
+                        <div class="field-label">Tagline</div>
+                        <div class="field-value">{esc(tagline)}</div>
+                    </div>
+                    <div>
+                        <div class="field-label">Domain &amp; Audience</div>
+                        <div class="field-value">{esc(domain_audience)}</div>
+                        <div class="field-label">Region</div>
+                        <div class="field-value">{esc(inputs.get('country_region'))}</div>
+                        <div class="chip-row">
+                            <span class="chip">AI-First</span>
+                            <span class="chip">{esc(inputs.get('domain'), 'General')}</span>
+                            <span class="chip">{esc(inputs.get('business_stage'), 'Startup')}</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass-panel span-4">
+                <div class="panel-head"><span class="ic">✓</span> 9. Validation</div>
+                <div class="validation-row"><span>Innovation</span><strong>{esc(innovation, '—')}</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:{score_pct(innovation)}%;"></div></div>
+                <div class="validation-row"><span>Market Demand</span><strong>{esc(market_demand, '—')}</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:{score_pct(market_demand)}%; background:var(--accent);"></div></div>
+                <div class="validation-row"><span>Feasibility</span><strong>{esc(feasibility, '—')}</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:{score_pct(feasibility)}%; background:var(--secondary);"></div></div>
+                <div class="spark-score">
+                    <div class="label">Overall Spark Score</div>
+                    <div class="value">{esc(overall)}</div>
+                </div>
+            </div>
+
+            <div class="glass-panel span-6">
+                <div class="panel-head"><span class="ic">⚠</span> 2. Problem Statement</div>
+                <div class="tint-box tint-error">{esc(inputs.get('problem_statement'), 'No problem statement provided.')}</div>
+            </div>
+
+            <div class="glass-panel span-6">
+                <div class="panel-head"><span class="ic">✦</span> 3. Proposed Solution</div>
+                <div class="tint-box tint-primary">{esc(idea.get('ai_solution') or idea.get('core_idea'), 'No solution details available.')}</div>
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------- 4/5. Market + Competitors ----------
+    market_stats = market.get("stats") or {}
+    cagr = market_stats.get("cagr") or market.get("cagr") or "N/A"
+    tam = market_stats.get("tam") or market.get("tam") or "N/A"
+
+    comp_rows = "".join(
+        f"""
+        <tr>
+            <td style="font-weight:700;">{esc(c.get('name'))}</td>
+            <td style="color:var(--primary);">{esc(c.get('strengths'))}</td>
+            <td style="color:var(--muted); font-size:.8rem;">{esc(c.get('weaknesses'))}</td>
+        </tr>
+        """
+        for c in competitors
+    ) or '<tr><td colspan="3" style="color:var(--muted);">No competitors found in current knowledge base sample.</td></tr>'
+
+    st.markdown(
+        f"""
+        <div class="bento-grid">
+            <div class="glass-panel span-12">
+                <div class="panel-head"><span class="ic">↗</span> 4. Market &amp; 5. Competitor Landscape</div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:2.5rem;">
+                    <div>
+                        <div class="field-label" style="margin-bottom:.8rem;">Market Trends</div>
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem;">
+                            <div class="stat-mini">
+                                <div class="num" style="color:var(--primary);">{esc(cagr)}</div>
+                                <div class="cap">CAGR - Sector Growth</div>
+                            </div>
+                            <div class="stat-mini">
+                                <div class="num" style="color:var(--accent);">{esc(tam)}</div>
+                                <div class="cap">Total Addressable Market</div>
+                            </div>
+                        </div>
+                        <p style="color:var(--muted); font-style:italic; margin-top:1.2rem; font-size:.88rem; line-height:1.6;">
+                            {esc(market.get('summary'), 'No market summary available.')}
+                        </p>
+                    </div>
+                    <div>
+                        <div class="field-label" style="margin-bottom:.8rem;">Competitor Benchmarking</div>
+                        <table class="comp-table">
+                            <thead><tr><th>Competitor</th><th>Strength</th><th>Weakness</th></tr></thead>
+                            <tbody>{comp_rows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------- 6. Business Model + 7. MVP Features ----------
+    mvp_html = "".join(
+        f"""
+        <div class="mvp-item">
+            <span class="ic">✦</span>
+            <div><h5>{esc(feature)}</h5></div>
+        </div>
+        """
+        for feature in mvp_features
+    ) or '<p style="color:var(--muted);">No MVP features generated yet.</p>'
+
+    st.markdown(
+        f"""
+        <div class="bento-grid">
+            <div class="glass-panel span-5">
+                <div class="panel-head"><span class="ic">$</span> 6. Business Model</div>
+                <div class="budget-row" style="font-size:.92rem;"><span>Revenue Model</span><strong>{esc(business.get('revenue_model'), 'TBD')}</strong></div>
+                <div class="budget-row" style="font-size:.92rem; margin-bottom:1rem;"><span>Pricing</span><strong>{esc(business.get('pricing'), 'TBD')}</strong></div>
+                <div class="field-label">Segments</div>
+                <div class="field-value" style="margin-bottom:0;">{esc(business.get('segments'), 'N/A')}</div>
+            </div>
+            <div class="glass-panel span-7">
+                <div class="panel-head"><span class="ic">▤</span> 7. MVP Features</div>
+                <div class="mvp-grid">{mvp_html}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------- 8. SWOT ----------
+    def swot_list(items):
+        items = items or []
+        if isinstance(items, str):
+            items = [items]
+        if not items:
+            return "<li>N/A</li>"
+        return "".join(f"<li>{esc(item)}</li>" for item in items)
+
+    st.markdown(
+        f"""
+        <div class="bento-grid">
+            <div class="glass-panel span-12">
+                <div class="panel-head"><span class="ic">▦</span> 8. SWOT Analysis</div>
+                <div class="swot-grid">
+                    <div class="swot-card swot-strength">
+                        <h5>🏋 Strengths</h5>
+                        <ul>{swot_list(swot.get('strengths'))}</ul>
+                    </div>
+                    <div class="swot-card swot-weak">
+                        <h5>⚠ Weaknesses</h5>
+                        <ul>{swot_list(swot.get('weaknesses'))}</ul>
+                    </div>
+                    <div class="swot-card swot-opp">
+                        <h5>💡 Opportunities</h5>
+                        <ul>{swot_list(swot.get('opportunities'))}</ul>
+                    </div>
+                    <div class="swot-card swot-threat">
+                        <h5>⛔ Threats</h5>
+                        <ul>{swot_list(swot.get('threats'))}</ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------- 10. Roadmap + 11. Budget ----------
+    roadmap_items = list(roadmap.items()) if roadmap else []
+    roadmap_html = "".join(
+        f"""
+        <div class="tl-item {'done' if i == 0 else ''}">
+            <div class="tl-dot"></div>
+            <h5>{esc(phase.replace('_', ' ').title())}</h5>
+            <p>{esc(detail)}</p>
+        </div>
+        """
+        for i, (phase, detail) in enumerate(roadmap_items)
+    ) or '<p style="color:var(--muted);">No roadmap generated yet.</p>'
+
+    budget_items = list(budget.items()) if budget else []
+    max_budget_val = 0
+    parsed_budget = []
+    for key, value in budget_items:
+        num = re.sub(r"[^\d.]", "", str(value)) or "0"
+        try:
+            num_val = float(num)
+        except ValueError:
+            num_val = 0
+        parsed_budget.append((key, value, num_val))
+        max_budget_val = max(max_budget_val, num_val)
+
+    bar_colors = ["var(--primary)", "var(--secondary)", "var(--accent)", "var(--muted)"]
+    budget_html = ""
+    total_seed = None
+    for i, (key, value, num_val) in enumerate(parsed_budget):
+        pct = (num_val / max_budget_val * 100) if max_budget_val else 0
+        color = bar_colors[i % len(bar_colors)]
+        budget_html += f"""
+            <div class="budget-row"><span>{esc(key.replace('_', ' ').title())}</span><strong>{esc(value)}</strong></div>
+            <div class="bar-track"><div class="bar-fill" style="width:{pct}%; background:{color};"></div></div>
+        """
+    if not budget_html:
+        budget_html = '<p style="color:var(--muted);">No budget breakdown available.</p>'
+
+    if parsed_budget:
+        total_val = sum(v for _, _, v in parsed_budget)
+        total_seed = f"${total_val:,.0f}"
+
+    st.markdown(
+        f"""
+        <div class="bento-grid">
+            <div class="glass-panel span-8">
+                <div class="panel-head"><span class="ic">⟿</span> 10. Implementation Roadmap</div>
+                <div class="timeline">{roadmap_html}</div>
+            </div>
+            <div class="glass-panel span-4">
+                <div class="panel-head"><span class="ic">💼</span> 11. Estimated Budget</div>
+                {budget_html}
+                <div class="budget-total">
+                    <div class="label">Total Required Seed</div>
+                    <div class="value">{esc(total_seed, 'N/A')}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---------- 12. Future Enhancements + 13. Retrieved Sources ----------
+    enh_html = "".join(
+        f'<div class="enh-item">✦ {esc(item)}</div>' for item in future_enh
+    ) or '<p style="color:var(--muted);">No future enhancements listed.</p>'
+
+    src_html = "".join(
+        f'<div class="source-item"><span>{esc(src)}</span><span>↗</span></div>'
+        for src in sources[:10]
+    ) or '<p style="color:var(--muted);">No sources retrieved.</p>'
+
+    st.markdown(
+        f"""
+        <div class="bento-grid">
+            <div class="glass-panel span-6">
+                <div class="panel-head"><span class="ic">🚀</span> 12. Future Enhancements</div>
+                <div class="enh-grid">{enh_html}</div>
+            </div>
+            <div class="glass-panel span-6">
+                <div class="panel-head"><span class="ic">📚</span> 13. Retrieved Sources (RAG)</div>
+                {src_html}
+            </div>
+        </div>
+        <div style="height:2rem;"></div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main():
@@ -1338,3 +2061,7 @@ def main():
             st.rerun()
     else:
         landing_page()
+
+
+if __name__ == "__main__":
+    main()
