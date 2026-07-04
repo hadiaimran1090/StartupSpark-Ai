@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import urllib.parse
+import urllib.request
 from typing import Dict, Any
 
 from src.rag.retriever import query_supabase
@@ -55,6 +57,79 @@ def _safe_join_texts(rows):
     return "\n\n".join(texts[:10])
 
 
+def _strip_html(value: str) -> str:
+    value = re.sub(r"<[^>]+>", " ", value or "")
+    value = re.sub(r"&quot;", '"', value)
+    value = re.sub(r"&amp;", "&", value)
+    value = re.sub(r"&#39;", "'", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _unique_rows(rows):
+    seen = set()
+    unique = []
+    for score, row in rows or []:
+        source = row.get("source") or row.get("title") or ""
+        text = row.get("text") or row.get("content") or ""
+        key = (source.strip().casefold(), text[:160].strip().casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((score, row))
+    return unique
+
+
+def external_web_context(inputs: Dict[str, Any], top_k: int = 4):
+    if os.getenv("ENABLE_EXTERNAL_SEARCH", "1").lower() in {"0", "false", "no"}:
+        return []
+    query_parts = [
+        inputs.get("problem_statement") or inputs.get("retriever_query") or "",
+        inputs.get("domain") or "",
+        inputs.get("country_region") or "",
+        "startup market competitors validation",
+    ]
+    query = " ".join(part for part in query_parts if part).strip()
+    if not query:
+        return []
+    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            html = response.read().decode("utf-8", "ignore")
+    except Exception:
+        return []
+
+    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, flags=re.I | re.S)
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, flags=re.I | re.S)
+    rows = []
+    for idx, title in enumerate(titles[:top_k]):
+        clean_title = _strip_html(title) or "External market source"
+        clean_snippet = _strip_html(snippets[idx] if idx < len(snippets) else "")
+        text = clean_snippet or clean_title
+        rows.append(
+            (
+                0.5,
+                {
+                    "title": clean_title,
+                    "source": f"External web: {clean_title}",
+                    "text": text,
+                    "metadata": {"source_type": "external_web"},
+                },
+            )
+        )
+    return rows
+
+
+def _input_profile(inputs: Dict[str, Any]) -> Dict[str, str]:
+    problem = (inputs.get("problem_statement") or inputs.get("retriever_query") or "the target customer problem").strip()
+    domain = (inputs.get("domain") or "AI startup").strip()
+    audience = (inputs.get("target_audience") or "target customers").strip()
+    region = (inputs.get("country_region") or "the selected market").strip()
+    stage = (inputs.get("business_stage") or "Idea").strip()
+    return {"problem": problem, "domain": domain, "audience": audience, "region": region, "stage": stage}
+
+
 def idea_generation_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, str]:
     problem = inputs.get('problem_statement', '').strip() or inputs.get('retriever_query', '')
     domain = inputs.get('domain', '')
@@ -76,14 +151,21 @@ def idea_generation_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[s
             }
 
     # deterministic fallback
-    name = f"{domain.split()[0]} AI Solutions"
+    profile = _input_profile(inputs)
+    name = f"{domain.split()[0] if domain else 'Spark'} AI Solutions"
     tagline = f"Solving: {problem[:80]}"
-    core = f"Build an AI-powered {domain} product that addresses: {problem}. Key context: {retrieved_text[:300]}"
-    ai_solution = "Use supervised models + domain-specific rules to extract insights from documents and make decisions for end users."
+    core = (
+        f"Build an AI-powered {profile['domain']} product for {profile['audience']} in {profile['region']} "
+        f"that reduces the pain point: {profile['problem']}."
+    )
+    ai_solution = (
+        "Use retrieval-augmented workflows, predictive scoring, automated triage, and a human-in-the-loop dashboard "
+        "to turn customer inputs into prioritized recommendations and operational actions."
+    )
     return {"startup_name": name, "tagline": tagline, "core_idea": core, "ai_solution": ai_solution}
 
 
-def market_research_agent(retrieved_text: str) -> Dict[str, Any]:
+def market_research_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
     # try LLM-based summary if available
     llm_prompt = (
         f"You are an analyst. Summarize the following context into a short market research summary and list top 3 trends as a JSON with keys: summary, trends (array).\\nContext: {retrieved_text[:2000]}"
@@ -94,12 +176,24 @@ def market_research_agent(retrieved_text: str) -> Dict[str, Any]:
         if isinstance(parsed, dict):
             return {"summary": parsed.get("summary"), "trends": parsed.get("trends"), "sources_count": 0}
     # summarize retrieved text heuristically
-    summary = (retrieved_text or '')[:1000]
-    trends = "; ".join([line.strip() for line in summary.split('\n')[:5] if line.strip()])
-    return {"summary": summary, "trends": trends, "sources_count": 0}
+    profile = _input_profile(inputs)
+    if retrieved_text:
+        summary = _strip_html(retrieved_text)[:1000]
+    else:
+        summary = (
+            f"{profile['domain']} demand in {profile['region']} is shaped by customer access gaps, workflow automation, "
+            f"cost pressure, and the need for measurable outcomes for {profile['audience']}. The opportunity is strongest "
+            "where the product can prove faster service, lower operating cost, or better decision quality in a focused pilot."
+        )
+    trends = [
+        "AI-assisted workflow automation",
+        "Localized customer acquisition and trust-building",
+        "Outcome-based pricing and pilot-first adoption",
+    ]
+    return {"summary": summary, "trends": trends, "sources_count": len(retrieved_text or "")}
 
 
-def competitor_analysis_agent(retrieved_text: str) -> Dict[str, Any]:
+def competitor_analysis_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
     # try LLM to extract competitors
     llm_prompt = (
         f"Extract up to 5 potential competitors or existing solutions from the context. Respond with JSON array under key 'competitors' where each item has name, strengths, weaknesses. Context: {retrieved_text[:2000]}"
@@ -111,37 +205,68 @@ def competitor_analysis_agent(retrieved_text: str) -> Dict[str, Any]:
             comps = parsed.get('competitors') or []
             return {"competitors": comps}
     # crude competitor extraction fallback
-    competitors = []
-    if retrieved_text:
-        lines = [l.strip() for l in retrieved_text.split('\n') if l.strip()]
-        for l in lines[:5]:
-            competitors.append({"name": l[:60], "strengths": "Established content", "weaknesses": "Limited customization"})
+    profile = _input_profile(inputs)
+    competitors = [
+        {
+            "name": f"Existing {profile['domain']} SaaS platforms",
+            "strengths": "Established workflows, integrations, and customer trust",
+            "weaknesses": "Often broad, expensive, and weakly localized for the selected audience",
+        },
+        {
+            "name": "Manual service providers and consultants",
+            "strengths": "High-touch support and local relationships",
+            "weaknesses": "Slow delivery, inconsistent quality, and limited scalability",
+        },
+        {
+            "name": "Generic AI assistants",
+            "strengths": "Low-cost and flexible for early experimentation",
+            "weaknesses": "Lack domain-specific data, compliance controls, and workflow ownership",
+        },
+    ]
     return {"competitors": competitors}
 
 
 def business_model_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    profile = _input_profile(inputs)
     stage = inputs.get('business_stage', 'Idea')
     budget = inputs.get('budget', '')
-    revenue = "SaaS subscription + professional services"
-    pricing = "Tiered pricing: freemium, standard, enterprise"
-    return {"revenue_model": revenue, "pricing": pricing, "budget": budget, "stage": stage}
+    revenue = "SaaS subscription + paid pilots + implementation support"
+    pricing = f"Pilot package for {profile['audience']}, then tiered monthly plans by usage, seats, or managed locations"
+    return {"revenue_model": revenue, "pricing": pricing, "budget": budget, "stage": stage, "segments": profile["audience"]}
 
 
 def swot_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
-    strengths = "Domain knowledge and low-cost MVP"
-    weaknesses = "Data availability and integration"
-    opportunities = "Growing demand and under-served markets"
-    threats = "Competition from incumbents and regulation"
+    profile = _input_profile(inputs)
+    strengths = [
+        f"Focused solution for {profile['audience']} in {profile['region']}",
+        "AI-first automation can reduce manual workload and response time",
+        "Pilot-friendly MVP can be launched with a narrow workflow",
+    ]
+    weaknesses = [
+        "Needs reliable customer data and workflow integrations",
+        "Early trust-building and proof of ROI will be required",
+    ]
+    opportunities = [
+        f"Underserved {profile['domain']} workflows can be localized by region and customer segment",
+        "Partnerships with existing operators can accelerate distribution",
+    ]
+    threats = [
+        "Incumbent platforms may copy high-value features",
+        "Regulatory, privacy, or procurement friction can slow adoption",
+    ]
     return {"strengths": strengths, "weaknesses": weaknesses, "opportunities": opportunities, "threats": threats}
 
 
 def validation_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    # simple heuristic scoring
+    profile = _input_profile(inputs)
+    problem_len = len(profile["problem"])
+    audience_bonus = 1 if profile["audience"] != "target customers" else 0
+    region_bonus = 1 if profile["region"] != "the selected market" else 0
     scores = {
-        "innovation": 8,
-        "market_demand": 7,
-        "feasibility": 7,
-        "scalability": 7,
+        "innovation": min(9, 6 + (1 if "ai" in profile["domain"].lower() else 0) + audience_bonus),
+        "market_demand": min(9, 6 + (1 if problem_len > 40 else 0) + region_bonus),
+        "feasibility": 7 if problem_len else 5,
+        "scalability": min(9, 6 + audience_bonus + region_bonus),
     }
     overall = round(sum(scores.values()) / len(scores), 2)
     return {**scores, "scores": scores, "overall": overall}
@@ -157,7 +282,7 @@ def report_generator(inputs: Dict[str, Any], agents_output: Dict[str, Any], retr
         "swot": agents_output.get('swot'),
         "swot_analysis": agents_output.get('swot'),
         "validation": agents_output.get('validation'),
-        "retrieved_sources": [r.get('source') or r.get('title') for s, r in (retrieved_rows or [])],
+        "retrieved_sources": list(dict.fromkeys([r.get('source') or r.get('title') for s, r in (retrieved_rows or []) if r.get('source') or r.get('title')])),
     }
     return report
 
@@ -170,11 +295,14 @@ def orchestrate_startup(inputs: Dict[str, Any]) -> Dict[str, Any]:
     # run retrieval (auto mode uses RPC then fallback)
     retrieved = query_supabase(query, domain=domain, top_k=6, mode='auto')
     retrieved_text = _safe_join_texts(retrieved)
+    if len(retrieved_text.strip()) < 350:
+        retrieved = _unique_rows((retrieved or []) + external_web_context(inputs, top_k=5))
+    retrieved_text = _safe_join_texts(retrieved)
 
     agents_output = {}
     agents_output['idea'] = idea_generation_agent(inputs, retrieved_text)
-    agents_output['market'] = market_research_agent(retrieved_text)
-    agents_output['competitor'] = competitor_analysis_agent(retrieved_text)
+    agents_output['market'] = market_research_agent(inputs, retrieved_text)
+    agents_output['competitor'] = competitor_analysis_agent(inputs, retrieved_text)
     agents_output['business'] = business_model_agent(inputs)
     agents_output['swot'] = swot_agent(inputs, retrieved_text)
     agents_output['validation'] = validation_agent(inputs)

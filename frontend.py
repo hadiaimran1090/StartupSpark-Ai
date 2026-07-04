@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from src.config import PROJECT_TITLE, SUPPORTED_DOMAINS
@@ -87,6 +88,23 @@ def remember_report(report):
     save_report_history(history[:12])
 
 
+def unique_nonempty(values):
+    seen = set()
+    unique = []
+    for value in values or []:
+        if not value:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        key = re.sub(r"\s+", " ", text).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(text)
+    return unique
+
+
 def safe_filename(value):
     return re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower() or "startup-report"
 
@@ -100,6 +118,31 @@ def esc(value, default="N/A"):
 def render_html(markup):
     html = "\n".join(line.strip() for line in textwrap.dedent(markup).strip().splitlines())
     st.markdown(html, unsafe_allow_html=True)
+
+
+def disable_auth_autofill():
+    components.html(
+        """
+        <script>
+        const apply = () => {
+            const doc = window.parent.document;
+            doc.querySelectorAll('input').forEach((input) => {
+                const label = (input.getAttribute('aria-label') || input.placeholder || '').toLowerCase();
+                if (label.includes('email') || label.includes('password')) {
+                    input.setAttribute('autocomplete', label.includes('password') ? 'new-password' : 'off');
+                    input.setAttribute('autocorrect', 'off');
+                    input.setAttribute('autocapitalize', 'none');
+                    input.setAttribute('spellcheck', 'false');
+                }
+            });
+        };
+        apply();
+        setTimeout(apply, 250);
+        setTimeout(apply, 1000);
+        </script>
+        """,
+        height=0,
+    )
 
 
 def score_value(value):
@@ -134,7 +177,25 @@ def normalized_swot(report):
 
 
 def escape_pdf_text(text):
-    return str(text).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    replacements = {
+        "•": "-",
+        "–": "-",
+        "—": "-",
+        "→": "->",
+        "↗": "->",
+        "✓": "OK",
+        "✦": "*",
+        "“": '"',
+        "”": '"',
+        "’": "'",
+        "‘": "'",
+        "…": "...",
+    }
+    cleaned = str(text)
+    for old, new in replacements.items():
+        cleaned = cleaned.replace(old, new)
+    cleaned = cleaned.encode("latin-1", "ignore").decode("latin-1")
+    return cleaned.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +236,7 @@ def report_to_blocks(report):
     roadmap = report.get("implementation_roadmap") or {}
     budget = report.get("estimated_budget") or {}
     future_enh = report.get("future_enhancements", [])
-    sources = report.get("retrieved_sources", [])
+    sources = unique_nonempty(report.get("retrieved_sources", []))
     mvp_features = report.get("mvp_features", [])
 
     blocks = [
@@ -213,8 +274,8 @@ def report_to_blocks(report):
         ("spacer", ""),
         ("h2", "6. Business Model"),
         ("kv", f"Revenue model: {business.get('revenue_model') or 'TBD'}"),
-        ("kv", f"Pricing: {business.get('pricing') or 'TBD'}"),
-        ("kv", f"Segments: {business.get('segments') or 'N/A'}"),
+        ("kv", f"Pricing:       {business.get('pricing') or 'TBD'}"),
+        ("kv", f"Segments:      {business.get('segments') or 'N/A'}"),
         ("spacer", ""),
         ("h2", "7. MVP Features"),
     ])
@@ -308,12 +369,12 @@ def _paginate_pdf_blocks(blocks):
                 start_new_page()
             continue
 
-        bullet = "•  " if kind == "item" else ""
+        bullet = "- " if kind == "item" else ""
         lines = _wrap_pdf_text(text, style["wrap"])
         for i, line in enumerate(lines):
             if y < bottom_y:
                 start_new_page()
-            display_text = (bullet + line) if i == 0 else (("   " if kind == "item" else "") + line)
+            display_text = (bullet + line) if i == 0 else (("  " if kind == "item" else "") + line)
             current_page.append(
                 {
                     "x": margin_x + style["indent"],
@@ -772,13 +833,13 @@ def inject_styles():
 
             .stRadio > div {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(70px, 1fr));
                 gap: .5rem;
                 padding: .45rem;
                 border: 1px solid rgba(173, 198, 255, .14);
                 border-radius: 1rem;
                 background: rgba(19, 27, 46, .9);
-                max-width: 460px;
+                max-width: 520px;
                 margin: 0 auto;
             }
 
@@ -796,6 +857,7 @@ def inject_styles():
                 font-family: Sora, sans-serif;
                 font-size: 1.05rem;
                 font-weight: 800;
+                white-space: nowrap;
             }
 
             .stRadio [role="radio"] p,
@@ -1435,6 +1497,7 @@ def landing_page():
 
 def auth_page():
     topbar(show_auth=False)
+    disable_auth_autofill()
     st.markdown('<div class="auth-back-button">', unsafe_allow_html=True)
     if st.button("←", key="auth_back"):
         set_page("landing")
@@ -1556,14 +1619,15 @@ def dashboard_page():
     user = st.session_state.get("auth_user") or {}
     name = (user.get("user_metadata") or {}).get("full_name") or user.get("email") or "Founder"
     avatar_initial = (name.strip()[:1] or "F").upper()
+    report_href = "?view=report" if st.session_state.get("last_report") else "?view=reports"
     st.markdown(
         f"""
         <div class="app-topbar">
             <div class="app-brand"><span>StartupSpark AI</span></div>
             <div class="app-nav">
                 <a href="?view=form">Form</a>
-                <a href="?view=form">Explore</a>
-                <a href="?view=reports">Reports</a>
+                <a href="?page=landing">Explore</a>
+                <a href="{report_href}">Reports</a>
             </div>
             <div class="app-user-icon">{esc(avatar_initial)}</div>
         </div>
@@ -1751,7 +1815,7 @@ def render_report(report):
     roadmap = report.get("implementation_roadmap") or {}
     budget = report.get("estimated_budget") or {}
     future_enh = report.get("future_enhancements", [])
-    sources = report.get("retrieved_sources", [])
+    sources = unique_nonempty(report.get("retrieved_sources", []))
     inputs = (report.get("metadata") or {}).get("input") or {}
 
     startup_name = idea.get("startup_name") or "Generated Startup Blueprint"
@@ -2074,7 +2138,9 @@ def main():
     st.session_state.setdefault("auth_mode", "login")
     query_page = st.query_params.get("page")
     query_mode = st.query_params.get("mode")
-    if query_page == "auth":
+    if query_page == "landing":
+        st.session_state["page"] = "landing"
+    elif query_page == "auth":
         st.session_state["page"] = "auth"
         st.session_state["auth_mode"] = "signup" if query_mode == "signup" else "login"
 
