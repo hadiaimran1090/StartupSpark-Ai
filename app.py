@@ -279,7 +279,7 @@ with col2:
 
             st.markdown('---')
             st.subheader("8. SWOT Analysis")
-            sw = report.get('swot', {})
+            sw = report.get('swot_analysis') or report.get('swot', {})
             st.write(f"**Strengths:** {sw.get('strengths')}")
             st.write(f"**Weaknesses:** {sw.get('weaknesses')}")
             st.write(f"**Opportunities:** {sw.get('opportunities')}")
@@ -289,6 +289,8 @@ with col2:
             st.subheader("9. Validation Score")
             val = report.get('validation', {})
             scores = val.get('scores', {})
+            if not scores:
+                scores = {k: val.get(k) for k in ('innovation', 'market_demand', 'feasibility', 'scalability') if val.get(k) is not None}
             for k, v in scores.items():
                 st.write(f"{k.capitalize()}: {v}/10")
             st.write(f"**Overall Score:** {val.get('overall')}/10")

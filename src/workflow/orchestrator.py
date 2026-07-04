@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, Any
 
 from src.rag.retriever import query_supabase
@@ -31,6 +32,20 @@ def call_llm(prompt: str) -> str:
         return ""
 
 
+def parse_llm_json(raw: str):
+    """Parse plain JSON or JSON wrapped in a markdown code fence."""
+    if not raw:
+        return None
+    text = raw.strip()
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def _safe_join_texts(rows):
     texts = []
     for s, r in rows:
@@ -50,8 +65,8 @@ def idea_generation_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[s
     )
     llm_out = call_llm(llm_prompt)
     if llm_out:
-        try:
-            parsed = json.loads(llm_out)
+        parsed = parse_llm_json(llm_out)
+        if isinstance(parsed, dict):
             # ensure keys exist
             return {
                 "startup_name": parsed.get("startup_name"),
@@ -59,9 +74,6 @@ def idea_generation_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[s
                 "core_idea": parsed.get("core_idea"),
                 "ai_solution": parsed.get("ai_solution"),
             }
-        except Exception:
-            # fall through to heuristic
-            pass
 
     # deterministic fallback
     name = f"{domain.split()[0]} AI Solutions"
@@ -78,11 +90,9 @@ def market_research_agent(retrieved_text: str) -> Dict[str, Any]:
     )
     llm_out = call_llm(llm_prompt)
     if llm_out:
-        try:
-            parsed = json.loads(llm_out)
+        parsed = parse_llm_json(llm_out)
+        if isinstance(parsed, dict):
             return {"summary": parsed.get("summary"), "trends": parsed.get("trends"), "sources_count": 0}
-        except Exception:
-            pass
     # summarize retrieved text heuristically
     summary = (retrieved_text or '')[:1000]
     trends = "; ".join([line.strip() for line in summary.split('\n')[:5] if line.strip()])
@@ -96,12 +106,10 @@ def competitor_analysis_agent(retrieved_text: str) -> Dict[str, Any]:
     )
     llm_out = call_llm(llm_prompt)
     if llm_out:
-        try:
-            parsed = json.loads(llm_out)
+        parsed = parse_llm_json(llm_out)
+        if isinstance(parsed, dict):
             comps = parsed.get('competitors') or []
             return {"competitors": comps}
-        except Exception:
-            pass
     # crude competitor extraction fallback
     competitors = []
     if retrieved_text:
@@ -136,7 +144,7 @@ def validation_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
         "scalability": 7,
     }
     overall = round(sum(scores.values()) / len(scores), 2)
-    return {"scores": scores, "overall": overall}
+    return {**scores, "scores": scores, "overall": overall}
 
 
 def report_generator(inputs: Dict[str, Any], agents_output: Dict[str, Any], retrieved_rows) -> Dict[str, Any]:
@@ -147,6 +155,7 @@ def report_generator(inputs: Dict[str, Any], agents_output: Dict[str, Any], retr
         "competitor_analysis": agents_output.get('competitor'),
         "business_model": agents_output.get('business'),
         "swot": agents_output.get('swot'),
+        "swot_analysis": agents_output.get('swot'),
         "validation": agents_output.get('validation'),
         "retrieved_sources": [r.get('source') or r.get('title') for s, r in (retrieved_rows or [])],
     }

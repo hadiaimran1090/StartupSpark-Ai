@@ -111,6 +111,23 @@ def score_pct(value):
     return max(0, min(100, v * 10))
 
 
+def normalized_validation(report):
+    validation = report.get("validation") or {}
+    scores = validation.get("scores") or {}
+    return {
+        **validation,
+        "innovation": validation.get("innovation", scores.get("innovation")),
+        "market_demand": validation.get("market_demand", scores.get("market_demand")),
+        "feasibility": validation.get("feasibility", scores.get("feasibility")),
+        "scalability": validation.get("scalability", scores.get("scalability")),
+        "overall": validation.get("overall", "N/A"),
+    }
+
+
+def normalized_swot(report):
+    return report.get("swot_analysis") or report.get("swot") or {}
+
+
 def escape_pdf_text(text):
     return str(text).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
@@ -144,12 +161,12 @@ PDF_STYLES = {
 def report_to_blocks(report):
     """Flatten a report dict into (kind, text) blocks used to build the PDF."""
     idea = report.get("idea") or {}
-    validation = report.get("validation") or {}
+    validation = normalized_validation(report)
     market = report.get("market_research") or {}
     business = report.get("business_model") or {}
     inputs = (report.get("metadata") or {}).get("input") or {}
     competitors = (report.get("competitor_analysis") or {}).get("competitors", [])
-    swot = report.get("swot_analysis") or {}
+    swot = normalized_swot(report)
     roadmap = report.get("implementation_roadmap") or {}
     budget = report.get("estimated_budget") or {}
     future_enh = report.get("future_enhancements", [])
@@ -1707,13 +1724,13 @@ def render_previous_reports(history):
 
 def render_report(report):
     idea = report.get("idea") or {}
-    validation = report.get("validation") or {}
+    validation = normalized_validation(report)
     market = report.get("market_research") or {}
     business = report.get("business_model") or {}
     competitor_data = report.get("competitor_analysis") or {}
     competitors = competitor_data.get("competitors", [])
     mvp_features = report.get("mvp_features", [])
-    swot = report.get("swot_analysis") or {}
+    swot = normalized_swot(report)
     roadmap = report.get("implementation_roadmap") or {}
     budget = report.get("estimated_budget") or {}
     future_enh = report.get("future_enhancements", [])
