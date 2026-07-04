@@ -1979,8 +1979,8 @@ def render_report(report):
     budget_html = ""
     total_seed = None
     for i, (key, value, num_val) in enumerate(parsed_budget):
-        pct = (num_val / max_budget_val * 100) if max_budget_val else 0
-        color = bar_colors[i % len(bar_colors)]
+        pct = (num_val / max_budget_val * 100) if max_budget_val > 0 else 0
+        color = bar_colors[i % len(bar_colors)] if bar_colors else "var(--primary)"
         budget_html += f"""
             <div class="budget-row"><span>{esc(key.replace('_', ' ').title())}</span><strong>{esc(value)}</strong></div>
             <div class="bar-track"><div class="bar-fill" style="width:{pct}%; background:{color};"></div></div>
@@ -2004,7 +2004,7 @@ def render_report(report):
                 {budget_html}
                 <div class="budget-total">
                     <div class="label">Total Required Seed</div>
-                    <div class="value">{esc(total_seed, 'N/A')}</div>
+                    <div class="value">{total_seed if total_seed is not None else 'N/A'}</div>
                 </div>
             </div>
         </div>
