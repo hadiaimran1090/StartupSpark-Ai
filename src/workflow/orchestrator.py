@@ -15,33 +15,52 @@ def _configured_key(name: str) -> str:
     return value
 
 
-def call_llm(prompt: str) -> str:
-    """Return an LLM response, preferring Gemini when GOOGLE_API_KEY is configured."""
+def call_llm(prompt: str, temperature: float = 0.45) -> str:
+    """Return an LLM response, preferring Gemini when GOOGLE_API_KEY is configured.
+
+    NOTE: previously both provider branches used `except Exception: pass`,
+    which silently swallowed the real failure reason (auth errors, bad key
+    format, missing packages, quota errors, etc.) and made every failure
+    look identical: "LLM did not return a response". Now every failure is
+    logged with the exception type/message so the real cause is visible in
+    the console/logs.
+    """
     if os.getenv("DISABLE_LLM", "").lower() in {"1", "true", "yes"}:
         return ""
+
     google_key = _configured_key("GOOGLE_API_KEY")
     if google_key:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
-
-            model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-            llm = ChatGoogleGenerativeAI(model=model, temperature=0.25, google_api_key=google_key)
+            model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            llm = ChatGoogleGenerativeAI(model=model, temperature=temperature, google_api_key=google_key)
             response = llm.invoke(prompt)
-            return getattr(response, "content", str(response)) or ""
-        except Exception:
-            pass
+            content = getattr(response, "content", str(response)) or ""
+            if content:
+                return content
+            print("[call_llm] Gemini returned an empty response; falling back to OpenAI if configured.")
+        except Exception as exc:
+            print(f"[call_llm] Gemini call failed: {type(exc).__name__}: {exc}")
 
     openai_key = _configured_key("OPENAI_API_KEY")
     if openai_key:
         try:
-            from langchain_community.llms import OpenAI
+            # ChatOpenAI moved out of langchain_community into its own
+            # package. Install it with: pip install -U langchain-openai
+            from langchain_openai import ChatOpenAI
 
             model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-            llm = OpenAI(temperature=0.25, model_name=model, openai_api_key=openai_key)
-            return llm(prompt) or ""
-        except Exception:
-            pass
+            llm = ChatOpenAI(temperature=temperature, model=model, api_key=openai_key)
+            response = llm.invoke(prompt)
+            content = getattr(response, "content", str(response)) or ""
+            if content:
+                return content
+            print("[call_llm] OpenAI returned an empty response.")
+        except Exception as exc:
+            print(f"[call_llm] OpenAI call failed: {type(exc).__name__}: {exc}")
+
     return ""
+
 
 
 def parse_llm_json(raw: str):
@@ -112,7 +131,8 @@ def external_web_context(inputs: Dict[str, Any], top_k: int = 4):
     try:
         with urllib.request.urlopen(req, timeout=8) as response:
             html = response.read().decode("utf-8", "ignore")
-    except Exception:
+    except Exception as exc:
+        print(f"[external_web_context] search request failed: {type(exc).__name__}: {exc}")
         return []
 
     titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, flags=re.I | re.S)
@@ -136,279 +156,165 @@ def external_web_context(inputs: Dict[str, Any], top_k: int = 4):
     return rows
 
 
-def _input_profile(inputs: Dict[str, Any]) -> Dict[str, str]:
-    problem = (inputs.get("problem_statement") or inputs.get("retriever_query") or "the target customer problem").strip()
-    domain = (inputs.get("domain") or "AI startup").strip()
-    audience = (inputs.get("target_audience") or "target customers").strip()
-    region = (inputs.get("country_region") or "the selected market").strip()
-    stage = (inputs.get("business_stage") or "Idea").strip()
-    return {"problem": problem, "domain": domain, "audience": audience, "region": region, "stage": stage}
-
-
-def idea_generation_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, str]:
-    problem = inputs.get('problem_statement', '').strip() or inputs.get('retriever_query', '')
-    domain = inputs.get('domain', '')
-    # If LLM available, ask it to generate a JSON response with fields
-    llm_prompt = (
-        f"You are an assistant that generates startup ideas.\nDomain: {domain}\nProblem: {problem}\nContext: {retrieved_text[:1000]}\n"
-        "Respond with a JSON object exactly with keys: startup_name, tagline, core_idea, ai_solution."
-    )
-    llm_out = call_llm(llm_prompt)
-    if llm_out:
-        parsed = parse_llm_json(llm_out)
-        if isinstance(parsed, dict):
-            # ensure keys exist
-            return {
-                "startup_name": parsed.get("startup_name"),
-                "tagline": parsed.get("tagline"),
-                "core_idea": parsed.get("core_idea"),
-                "ai_solution": parsed.get("ai_solution"),
+def _source_summary(rows):
+    sources = []
+    for score, row in rows or []:
+        title = row.get("title") or row.get("source") or "Untitled source"
+        text = _strip_html(row.get("text") or row.get("content") or "")
+        source = row.get("source") or title
+        if not text:
+            continue
+        sources.append(
+            {
+                "title": title,
+                "source": source,
+                "score": score,
+                "excerpt": text[:900],
             }
-
-    # deterministic fallback
-    profile = _input_profile(inputs)
-    name = f"{domain.split()[0] if domain else 'Spark'} AI Solutions"
-    tagline = f"Solving: {problem[:80]}"
-    core = (
-        f"Build an AI-powered {profile['domain']} product for {profile['audience']} in {profile['region']} "
-        f"that reduces the pain point: {profile['problem']}."
-    )
-    ai_solution = (
-        "Use retrieval-augmented workflows, predictive scoring, automated triage, and a human-in-the-loop dashboard "
-        "to turn customer inputs into prioritized recommendations and operational actions."
-    )
-    return {"startup_name": name, "tagline": tagline, "core_idea": core, "ai_solution": ai_solution}
-
-
-def market_research_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
-    # try LLM-based summary if available
-    llm_prompt = (
-        f"You are an analyst. Summarize the following context into a short market research summary and list top 3 trends as a JSON with keys: summary, trends (array).\\nContext: {retrieved_text[:2000]}"
-    )
-    llm_out = call_llm(llm_prompt)
-    if llm_out:
-        parsed = parse_llm_json(llm_out)
-        if isinstance(parsed, dict):
-            return {"summary": parsed.get("summary"), "trends": parsed.get("trends"), "sources_count": 0}
-    # summarize retrieved text heuristically
-    profile = _input_profile(inputs)
-    if retrieved_text:
-        summary = _strip_html(retrieved_text)[:1000]
-    else:
-        summary = (
-            f"{profile['domain']} demand in {profile['region']} is shaped by customer access gaps, workflow automation, "
-            f"cost pressure, and the need for measurable outcomes for {profile['audience']}. The opportunity is strongest "
-            "where the product can prove faster service, lower operating cost, or better decision quality in a focused pilot."
         )
-    trends = [
-        "AI-assisted workflow automation",
-        "Localized customer acquisition and trust-building",
-        "Outcome-based pricing and pilot-first adoption",
-    ]
-    return {"summary": summary, "trends": trends, "sources_count": len(retrieved_text or "")}
+    return sources[:12]
 
 
-def competitor_analysis_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
-    # try LLM to extract competitors
-    llm_prompt = (
-        f"Extract up to 5 potential competitors or existing solutions from the context. Respond with JSON array under key 'competitors' where each item has name, strengths, weaknesses. Context: {retrieved_text[:2000]}"
-    )
-    llm_out = call_llm(llm_prompt)
-    if llm_out:
-        parsed = parse_llm_json(llm_out)
-        if isinstance(parsed, dict):
-            comps = parsed.get('competitors') or []
-            return {"competitors": comps}
-    # crude competitor extraction fallback
-    profile = _input_profile(inputs)
-    competitors = [
-        {
-            "name": f"Existing {profile['domain']} SaaS platforms",
-            "strengths": "Established workflows, integrations, and customer trust",
-            "weaknesses": "Often broad, expensive, and weakly localized for the selected audience",
-        },
-        {
-            "name": "Manual service providers and consultants",
-            "strengths": "High-touch support and local relationships",
-            "weaknesses": "Slow delivery, inconsistent quality, and limited scalability",
-        },
-        {
-            "name": "Generic AI assistants",
-            "strengths": "Low-cost and flexible for early experimentation",
-            "weaknesses": "Lack domain-specific data, compliance controls, and workflow ownership",
-        },
-    ]
-    return {"competitors": competitors}
+def _tools_used(rows):
+    tools = ["supabase_rag_retriever"]
+    if any(((row.get("metadata") or {}).get("source_type") == "external_web") for _, row in (rows or [])):
+        tools.append("external_web_search")
+    return tools
 
 
-def business_model_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    profile = _input_profile(inputs)
-    stage = inputs.get('business_stage', 'Idea')
-    budget = inputs.get('budget', '')
-    prompt = (
-        "Create a real-world business model for this startup. Use the input constraints and market context only; "
-        "avoid generic placeholder wording. Respond as JSON with keys: revenue_model, pricing, budget, stage, segments.\n"
-        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}"
-    )
-    parsed = extract_json_object(call_llm(prompt))
-    if parsed:
-        return {
-            "revenue_model": parsed.get("revenue_model") or "Usage-based subscription with paid pilots",
-            "pricing": parsed.get("pricing") or f"Pilot package for {profile['audience']}",
-            "budget": parsed.get("budget") or budget,
-            "stage": parsed.get("stage") or stage,
-            "segments": parsed.get("segments") or profile["audience"],
-        }
-    revenue = "SaaS subscription + paid pilots + implementation support"
-    pricing = f"Pilot package for {profile['audience']}, then tiered monthly plans by usage, seats, or managed locations"
-    return {"revenue_model": revenue, "pricing": pricing, "budget": budget, "stage": stage, "segments": profile["audience"]}
-
-
-def swot_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
-    profile = _input_profile(inputs)
-    prompt = (
-        "Build a grounded SWOT analysis for this startup idea. Use the retrieved context and user inputs. "
-        "Respond as JSON with array keys: strengths, weaknesses, opportunities, threats.\n"
-        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}\nContext: {retrieved_text[:2500]}"
-    )
-    parsed = extract_json_object(call_llm(prompt))
-    if parsed:
-        return {
-            "strengths": parsed.get("strengths") or [],
-            "weaknesses": parsed.get("weaknesses") or [],
-            "opportunities": parsed.get("opportunities") or [],
-            "threats": parsed.get("threats") or [],
-        }
-    strengths = [
-        f"Focused solution for {profile['audience']} in {profile['region']}",
-        "AI-first automation can reduce manual workload and response time",
-        "Pilot-friendly MVP can be launched with a narrow workflow",
-    ]
-    weaknesses = [
-        "Needs reliable customer data and workflow integrations",
-        "Early trust-building and proof of ROI will be required",
-    ]
-    opportunities = [
-        f"Underserved {profile['domain']} workflows can be localized by region and customer segment",
-        "Partnerships with existing operators can accelerate distribution",
-    ]
-    threats = [
-        "Incumbent platforms may copy high-value features",
-        "Regulatory, privacy, or procurement friction can slow adoption",
-    ]
-    return {"strengths": strengths, "weaknesses": weaknesses, "opportunities": opportunities, "threats": threats}
-
-
-def validation_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    profile = _input_profile(inputs)
-    prompt = (
-        "Score this startup idea from 1 to 10 using the user's market, audience, stage, and budget. "
-        "Respond as JSON with numeric keys: innovation, market_demand, feasibility, scalability, overall, "
-        "and a short rationale key.\n"
-        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}"
-    )
-    parsed = extract_json_object(call_llm(prompt))
-    if parsed:
-        scores = {
-            "innovation": parsed.get("innovation"),
-            "market_demand": parsed.get("market_demand"),
-            "feasibility": parsed.get("feasibility"),
-            "scalability": parsed.get("scalability"),
-        }
-        numeric_scores = [float(v) for v in scores.values() if isinstance(v, (int, float))]
-        overall = parsed.get("overall") or (round(sum(numeric_scores) / len(numeric_scores), 2) if numeric_scores else "N/A")
-        return {**scores, "scores": scores, "overall": overall, "rationale": parsed.get("rationale")}
-    problem_len = len(profile["problem"])
-    audience_bonus = 1 if profile["audience"] != "target customers" else 0
-    region_bonus = 1 if profile["region"] != "the selected market" else 0
-    scores = {
-        "innovation": min(9, 6 + (1 if "ai" in profile["domain"].lower() else 0) + audience_bonus),
-        "market_demand": min(9, 6 + (1 if problem_len > 40 else 0) + region_bonus),
-        "feasibility": 7 if problem_len else 5,
-        "scalability": min(9, 6 + audience_bonus + region_bonus),
+def _required_report_keys():
+    return {
+        "idea",
+        "market_research",
+        "competitor_analysis",
+        "business_model",
+        "swot_analysis",
+        "validation",
+        "mvp_features",
+        "implementation_roadmap",
+        "estimated_budget",
+        "future_enhancements",
     }
-    overall = round(sum(scores.values()) / len(scores), 2)
-    return {**scores, "scores": scores, "overall": overall}
 
 
-def _budget_number(value):
-    try:
-        cleaned = re.sub(r"[^\d.]", "", str(value or ""))
-        return float(cleaned) if cleaned else None
-    except Exception:
-        return None
+def generate_llm_report(inputs: Dict[str, Any], retrieved_rows) -> Dict[str, Any]:
+    sources = _source_summary(retrieved_rows)
+    if not _configured_key("GOOGLE_API_KEY") and not _configured_key("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "No LLM key configured. Add GOOGLE_API_KEY for Gemini or OPENAI_API_KEY in .env; "
+            "hardcoded fallback report generation is disabled."
+        )
+    if not sources:
+        raise RuntimeError(
+            "No RAG or web context was retrieved. Add/upload knowledge-base data or enable external search; "
+            "hardcoded fallback report generation is disabled."
+        )
 
+    prompt = f"""
+You are StartupSpark AI's research-and-strategy engine.
 
-def strategic_plan_agent(inputs: Dict[str, Any], retrieved_text: str, agents_output: Dict[str, Any]) -> Dict[str, Any]:
-    budget_total = _budget_number(inputs.get("budget"))
-    prompt = (
-        "Generate implementation details for a startup report using real-world assumptions from the inputs and context. "
-        "Avoid fixed boilerplate. Respond as JSON exactly with keys: mvp_features (array of 5-7 specific features), "
-        "implementation_roadmap (object with phase_1..phase_4 practical milestones), "
-        "estimated_budget (object with budget categories and numeric USD values when budget is known), "
-        "future_enhancements (array of 3-5 specific enhancements).\n"
-        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}\n"
-        f"Generated analysis: {json.dumps(agents_output, ensure_ascii=False)[:2500]}\n"
-        f"Retrieved context: {retrieved_text[:2500]}"
+Generate one complete startup report from the USER_INPUTS and RETRIEVED_CONTEXT below.
+Use the retrieved context as evidence, then reason with current market/business judgment.
+
+Strict rules:
+- Return only valid JSON. No markdown fences. No commentary.
+- Do not use placeholders or generic templates.
+- Do not name the startup by simply combining the domain with "AI Solutions", "AI", "Tech", or "Startup".
+- Generate a distinctive startup_name each run, suitable for a real company.
+- Every section must be specific to the user problem, audience, country/region, budget, stage, and retrieved context.
+- Competitors may be direct, indirect, or adjacent substitutes, but must be plausible and specific.
+- Budget values should fit the user's available budget when provided.
+- Include evidence_notes fields where useful, citing retrieved source titles or source names from RETRIEVED_CONTEXT.
+- Vary wording and strategic choices naturally; do not repeat canned feature lists.
+
+Return this exact JSON shape:
+{{
+  "idea": {{
+    "startup_name": "distinctive brand name",
+    "tagline": "short specific tagline",
+    "core_idea": "specific product concept",
+    "ai_solution": "specific AI/RAG/automation approach"
+  }},
+  "market_research": {{
+    "summary": "grounded market summary",
+    "trends": ["specific trend 1", "specific trend 2", "specific trend 3"],
+    "stats": {{"tam": "market estimate or reasoned proxy", "cagr": "growth estimate or reasoned proxy"}},
+    "evidence_notes": ["source-backed note 1", "source-backed note 2"]
+  }},
+  "competitor_analysis": {{
+    "competitors": [
+      {{"name": "competitor or substitute", "strengths": "specific strength", "weaknesses": "specific weakness"}}
+    ]
+  }},
+  "business_model": {{
+    "revenue_model": "specific revenue model",
+    "pricing": "specific pricing strategy",
+    "budget": "user budget or budget interpretation",
+    "stage": "stage",
+    "segments": "specific buyer/user segments"
+  }},
+  "swot_analysis": {{
+    "strengths": ["specific strength"],
+    "weaknesses": ["specific weakness"],
+    "opportunities": ["specific opportunity"],
+    "threats": ["specific threat"]
+  }},
+  "validation": {{
+    "innovation": 1,
+    "market_demand": 1,
+    "feasibility": 1,
+    "scalability": 1,
+    "overall": 1,
+    "rationale": "short scoring rationale"
+  }},
+  "mvp_features": ["specific MVP feature"],
+  "implementation_roadmap": {{
+    "phase_1": "specific milestone and timeframe",
+    "phase_2": "specific milestone and timeframe",
+    "phase_3": "specific milestone and timeframe",
+    "phase_4": "specific milestone and timeframe"
+  }},
+  "estimated_budget": {{
+    "category_name": 0
+  }},
+  "future_enhancements": ["specific enhancement"]
+}}
+
+USER_INPUTS:
+{json.dumps(inputs, ensure_ascii=False, indent=2)}
+
+RETRIEVED_CONTEXT:
+{json.dumps(sources, ensure_ascii=False, indent=2)}
+""".strip()
+
+    raw = call_llm(prompt, temperature=0.8)
+    if not raw:
+        raise RuntimeError(
+            "LLM did not return a response. Check GOOGLE_API_KEY/GEMINI_MODEL or OPENAI_API_KEY/OPENAI_MODEL; "
+            "see console logs from call_llm for the specific provider error. "
+            "Hardcoded fallback report generation is disabled."
+        )
+    report = extract_json_object(raw)
+    missing = _required_report_keys() - set(report)
+    if missing:
+        raise RuntimeError(
+            "LLM did not return a complete report JSON. Missing keys: "
+            + ", ".join(sorted(missing))
+        )
+
+    report["swot"] = report.get("swot_analysis") or {}
+    report["metadata"] = {
+        "input": inputs,
+        "generation": {
+            "mode": "rag_llm",
+            "retrieved_source_count": len(sources),
+            "llm_provider": "gemini" if _configured_key("GOOGLE_API_KEY") else "openai",
+            "tools_used": _tools_used(retrieved_rows),
+        },
+    }
+    report["retrieved_sources"] = list(
+        dict.fromkeys(src.get("source") or src.get("title") for src in sources if src.get("source") or src.get("title"))
     )
-    parsed = extract_json_object(call_llm(prompt))
-    if parsed:
-        return {
-            "mvp_features": parsed.get("mvp_features") or [],
-            "implementation_roadmap": parsed.get("implementation_roadmap") or {},
-            "estimated_budget": parsed.get("estimated_budget") or {},
-            "future_enhancements": parsed.get("future_enhancements") or [],
-        }
-
-    profile = _input_profile(inputs)
-    stage = profile["stage"].lower()
-    mvp = [
-        f"Intake workflow tailored to {profile['audience']}",
-        f"Domain knowledge search for {profile['domain']} decisions",
-        f"Prioritization engine for the core problem: {profile['problem'][:90]}",
-        f"Operator dashboard for {profile['region']} pilot tracking",
-        "Feedback capture tied to measurable customer outcomes",
-    ]
-    roadmap = {
-        "phase_1": f"Validate {profile['audience']} workflows and success metrics in {profile['region']} (2-3 weeks)",
-        "phase_2": f"Build a {stage} MVP around the highest-friction workflow (4-8 weeks)",
-        "phase_3": "Run paid or design-partner pilots and compare outcomes against baseline operations (4-6 weeks)",
-        "phase_4": "Package repeatable onboarding, support, and analytics for launch expansion",
-    }
-    if budget_total:
-        est = {
-            "product_engineering": round(budget_total * 0.45, 2),
-            "data_and_ai_infrastructure": round(budget_total * 0.2, 2),
-            "customer_discovery_and_pilots": round(budget_total * 0.15, 2),
-            "go_to_market": round(budget_total * 0.12, 2),
-            "operations_and_compliance": round(budget_total * 0.08, 2),
-        }
-    else:
-        est = {
-            "product_engineering": "Estimate after MVP scope lock",
-            "data_and_ai_infrastructure": "Estimate after model and data volume selection",
-            "go_to_market": "Estimate after pilot channel selection",
-        }
-    future = [
-        f"Regional localization for {profile['region']} customer segments",
-        "Partner integrations with the systems customers already use",
-        "Outcome analytics that prove time, cost, or quality improvement",
-    ]
-    return {"mvp_features": mvp, "implementation_roadmap": roadmap, "estimated_budget": est, "future_enhancements": future}
-
-
-def report_generator(inputs: Dict[str, Any], agents_output: Dict[str, Any], retrieved_rows) -> Dict[str, Any]:
-    report = {
-        "metadata": {"input": inputs},
-        "idea": agents_output.get('idea'),
-        "market_research": agents_output.get('market'),
-        "competitor_analysis": agents_output.get('competitor'),
-        "business_model": agents_output.get('business'),
-        "swot": agents_output.get('swot'),
-        "swot_analysis": agents_output.get('swot'),
-        "validation": agents_output.get('validation'),
-        "retrieved_sources": list(dict.fromkeys([r.get('source') or r.get('title') for s, r in (retrieved_rows or []) if r.get('source') or r.get('title')])),
-    }
     return report
 
 
@@ -424,18 +330,4 @@ def orchestrate_startup(inputs: Dict[str, Any]) -> Dict[str, Any]:
         retrieved = _unique_rows((retrieved or []) + external_web_context(inputs, top_k=5))
     retrieved_text = _safe_join_texts(retrieved)
 
-    agents_output = {}
-    agents_output['idea'] = idea_generation_agent(inputs, retrieved_text)
-    agents_output['market'] = market_research_agent(inputs, retrieved_text)
-    agents_output['competitor'] = competitor_analysis_agent(inputs, retrieved_text)
-    agents_output['business'] = business_model_agent(inputs)
-    agents_output['swot'] = swot_agent(inputs, retrieved_text)
-    agents_output['validation'] = validation_agent(inputs)
-
-    final = report_generator(inputs, agents_output, retrieved)
-    plan = strategic_plan_agent(inputs, retrieved_text, agents_output)
-    final["mvp_features"] = plan.get("mvp_features", [])
-    final["implementation_roadmap"] = plan.get("implementation_roadmap", {})
-    final["estimated_budget"] = plan.get("estimated_budget", {})
-    final["future_enhancements"] = plan.get("future_enhancements", [])
-    return final
+    return generate_llm_report(inputs, retrieved)

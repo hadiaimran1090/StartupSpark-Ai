@@ -3,11 +3,11 @@ import json
 import os
 import re
 import textwrap
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from src.config import PROJECT_TITLE, SUPPORTED_DOMAINS
@@ -251,8 +251,7 @@ def render_html(markup):
 
 
 def disable_auth_autofill():
-    components.html(
-        """
+    markup = """
         <script>
         const apply = () => {
             const doc = window.parent.document;
@@ -270,9 +269,8 @@ def disable_auth_autofill():
         setTimeout(apply, 250);
         setTimeout(apply, 1000);
         </script>
-        """,
-        height=0,
-    )
+        """
+    st.iframe(f"data:text/html;charset=utf-8,{urllib.parse.quote(markup)}", height=1)
 
 
 def score_value(value):
@@ -304,6 +302,21 @@ def normalized_validation(report):
 
 def normalized_swot(report):
     return report.get("swot_analysis") or report.get("swot") or {}
+
+def normalized_competitors(report):
+    data = report.get("competitor_analysis")
+    if isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict):
+        raw = data.get("competitors", [])
+        raw = raw if isinstance(raw, list) else []
+    else:
+        raw = []
+    # coerce any non-dict entries (e.g. plain strings) into a dict shape
+    return [
+        c if isinstance(c, dict) else {"name": str(c), "strengths": "N/A", "weaknesses": "N/A"}
+        for c in raw
+    ]
 
 
 def escape_pdf_text(text):
@@ -361,7 +374,7 @@ def report_to_blocks(report):
     market = report.get("market_research") or {}
     business = report.get("business_model") or {}
     inputs = (report.get("metadata") or {}).get("input") or {}
-    competitors = (report.get("competitor_analysis") or {}).get("competitors", [])
+    competitors = normalized_competitors(report)
     swot = normalized_swot(report)
     roadmap = report.get("implementation_roadmap") or {}
     budget = report.get("estimated_budget") or {}
@@ -1957,8 +1970,7 @@ def render_report(report):
     validation = normalized_validation(report)
     market = report.get("market_research") or {}
     business = report.get("business_model") or {}
-    competitor_data = report.get("competitor_analysis") or {}
-    competitors = competitor_data.get("competitors", [])
+    competitors = normalized_competitors(report)             
     mvp_features = report.get("mvp_features", [])
     swot = normalized_swot(report)
     roadmap = report.get("implementation_roadmap") or {}
