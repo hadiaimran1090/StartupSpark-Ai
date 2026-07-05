@@ -27,6 +27,7 @@ DISPLAY_TO_FOLDER = {
 
 REPORTS_DIR = Path("reports")
 REPORT_HISTORY_FILE = REPORTS_DIR / "report_history.json"
+REPORTS_TABLE = "startup_reports"
 
 
 def create_supabase_auth_client():
@@ -37,6 +38,17 @@ def create_supabase_auth_client():
     if not supabase_url or not supabase_anon:
         return None
     return create_client(supabase_url, supabase_anon)
+
+
+def create_supabase_reports_client():
+    from supabase import create_client
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    anon_key = os.getenv("SUPABASE_ANON_KEY")
+    if not supabase_url or not (service_key or anon_key):
+        return None
+    return create_client(supabase_url, service_key or anon_key)
 
 
 def user_to_dict(user_obj):
@@ -52,21 +64,116 @@ def user_to_dict(user_obj):
     }
 
 
-def load_report_history():
-    if "report_history" in st.session_state:
-        return st.session_state["report_history"]
+def current_user_id():
+    user = st.session_state.get("auth_user") or {}
+    return user.get("id")
+
+
+def normalize_report_entry(row):
+    if not row:
+        return None
+    report = row.get("report") or {}
+    created_at = row.get("created_at") or datetime.now().isoformat()
+    try:
+        display_date = datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime("%b %d, %Y %I:%M %p")
+    except Exception:
+        display_date = str(created_at)
+    return {
+        "id": row.get("id"),
+        "created_at": display_date,
+        "title": row.get("title") or report_title(report),
+        "report": report,
+    }
+
+
+def load_local_report_history(user_id):
     try:
         history = json.loads(REPORT_HISTORY_FILE.read_text(encoding="utf-8")) if REPORT_HISTORY_FILE.exists() else []
     except Exception:
         history = []
+    if user_id:
+        return [item for item in history if item.get("user_id") == user_id]
+    return []
+
+
+def save_local_report_history(history):
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    REPORT_HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+def reports_table_missing(exc):
+    text = str(exc)
+    return "PGRST205" in text or f"'{REPORTS_TABLE}'" in text or f"'{REPORTS_TABLE}" in text
+
+
+def warn_reports_storage_issue(action, exc):
+    if reports_table_missing(exc):
+        if not st.session_state.get("startup_reports_table_warning_shown"):
+            st.warning(
+                "Supabase reports table is not created yet. Run "
+                "`sql/supabase_startup_reports.sql` in the Supabase SQL editor; "
+                "until then reports will use the local fallback."
+            )
+            st.session_state["startup_reports_table_warning_shown"] = True
+        return
+    st.warning(f"Supabase reports could not be {action}, using local fallback: {exc}")
+
+
+def load_report_history():
+    user_id = current_user_id()
+    cache_key = st.session_state.get("report_history_user_id")
+    if "report_history" in st.session_state and cache_key == user_id:
+        return st.session_state["report_history"]
+    if not user_id:
+        st.session_state["report_history"] = []
+        st.session_state["report_history_user_id"] = None
+        return []
+    client = create_supabase_reports_client()
+    if client:
+        try:
+            res = (
+                client.table(REPORTS_TABLE)
+                .select("id,user_id,title,report,created_at")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(25)
+                .execute()
+            )
+            history = [entry for entry in (normalize_report_entry(row) for row in (res.data or [])) if entry]
+            st.session_state["report_history"] = history
+            st.session_state["report_history_user_id"] = user_id
+            return history
+        except Exception as exc:
+            warn_reports_storage_issue("loaded", exc)
+    history = load_local_report_history(user_id)
     st.session_state["report_history"] = history
+    st.session_state["report_history_user_id"] = user_id
     return history
 
 
-def save_report_history(history):
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    REPORT_HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
-    st.session_state["report_history"] = history
+def clear_report_history_cache():
+    st.session_state.pop("report_history", None)
+    st.session_state.pop("report_history_user_id", None)
+
+
+def delete_report_entry(report_id):
+    user_id = current_user_id()
+    if not user_id or not report_id:
+        return
+    client = create_supabase_reports_client()
+    if client:
+        try:
+            client.table(REPORTS_TABLE).delete().eq("id", report_id).eq("user_id", user_id).execute()
+            clear_report_history_cache()
+            return
+        except Exception as exc:
+            warn_reports_storage_issue("deleted", exc)
+    try:
+        all_history = json.loads(REPORT_HISTORY_FILE.read_text(encoding="utf-8")) if REPORT_HISTORY_FILE.exists() else []
+    except Exception:
+        all_history = []
+    save_local_report_history([h for h in all_history if h.get("id") != report_id or h.get("user_id") != user_id])
+    clear_report_history_cache()
 
 
 def report_title(report):
@@ -77,15 +184,38 @@ def report_title(report):
 
 
 def remember_report(report):
-    history = load_report_history()
+    user_id = current_user_id()
+    if not user_id:
+        return None
     entry = {
         "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
+        "user_id": user_id,
         "created_at": datetime.now().strftime("%b %d, %Y %I:%M %p"),
         "title": report_title(report),
         "report": report,
     }
-    history = [entry] + history
-    save_report_history(history[:12])
+    client = create_supabase_reports_client()
+    if client:
+        try:
+            res = (
+                client.table(REPORTS_TABLE)
+                .insert({"user_id": user_id, "title": entry["title"], "report": report})
+                .execute()
+            )
+            saved = normalize_report_entry((res.data or [None])[0])
+            clear_report_history_cache()
+            return saved or entry
+        except Exception as exc:
+            warn_reports_storage_issue("saved", exc)
+    try:
+        all_history = json.loads(REPORT_HISTORY_FILE.read_text(encoding="utf-8")) if REPORT_HISTORY_FILE.exists() else []
+    except Exception:
+        all_history = []
+    user_history = [item for item in all_history if item.get("user_id") == user_id]
+    other_history = [item for item in all_history if item.get("user_id") != user_id]
+    save_local_report_history(([entry] + user_history)[:12] + other_history)
+    clear_report_history_cache()
+    return entry
 
 
 def unique_nonempty(values):
@@ -1324,14 +1454,21 @@ def inject_styles():
     )
 
 
-def set_page(page, auth_mode="login"):
+def set_page(page, auth_mode="login", view=None):
     st.session_state["page"] = page
     st.session_state["auth_mode"] = auth_mode
-    if page != "auth":
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
+    try:
+        st.query_params["page"] = page
+        if page == "auth":
+            st.query_params["mode"] = auth_mode
+        else:
+            st.query_params.pop("mode", None)
+        if page == "dashboard":
+            st.query_params["view"] = view or st.session_state.get("dashboard_view", "form")
+        else:
+            st.query_params.pop("view", None)
+    except Exception:
+        pass
 
 
 def topbar(show_auth=True):
@@ -1616,16 +1753,22 @@ def dashboard_page():
         st.session_state["dashboard_view"] = "report"
 
     history = load_report_history()
+    if query_view == "report" and not st.session_state.get("last_report"):
+        if history:
+            st.session_state["last_report"] = (history[0] or {}).get("report") or {}
+            st.session_state["dashboard_view"] = "report"
+        else:
+            st.session_state["dashboard_view"] = "reports"
     user = st.session_state.get("auth_user") or {}
     name = (user.get("user_metadata") or {}).get("full_name") or user.get("email") or "Founder"
     avatar_initial = (name.strip()[:1] or "F").upper()
-    report_href = "?view=report" if st.session_state.get("last_report") else "?view=reports"
+    report_href = "?page=dashboard&view=report" if st.session_state.get("last_report") else "?page=dashboard&view=reports"
     st.markdown(
         f"""
         <div class="app-topbar">
             <div class="app-brand"><span>StartupSpark AI</span></div>
             <div class="app-nav">
-                <a href="?view=form">Form</a>
+                <a href="?page=dashboard&view=form">Form</a>
                 <a href="?page=landing">Explore</a>
                 <a href="{report_href}">Reports</a>
             </div>
@@ -1654,10 +1797,12 @@ def dashboard_page():
         roadmap_type = "primary" if current_view == "reports" else "secondary"
         if st.button("Strategy", use_container_width=True, type=strategy_type):
             st.session_state["dashboard_view"] = "form"
+            st.query_params["page"] = "dashboard"
             st.query_params["view"] = "form"
             st.rerun()
         if st.button("Roadmap", use_container_width=True, type=roadmap_type):
             st.session_state["dashboard_view"] = "reports"
+            st.query_params["page"] = "dashboard"
             st.query_params["view"] = "reports"
             st.rerun()
         if st.button("Logout", use_container_width=True):
@@ -1738,8 +1883,11 @@ def dashboard_page():
                 try:
                     report = orchestrate_startup(inputs)
                     st.session_state["last_report"] = report
-                    remember_report(report)
+                    saved_entry = remember_report(report)
+                    if saved_entry:
+                        report["metadata"] = {**(report.get("metadata") or {}), "report_id": saved_entry.get("id")}
                     st.session_state["dashboard_view"] = "report"
+                    st.query_params["page"] = "dashboard"
                     st.query_params["view"] = "report"
                     st.success("Strategy forged. Opening report.")
                     st.rerun()
@@ -1780,6 +1928,7 @@ def render_previous_reports(history):
             if st.button("Open Report", key=f"open_{item.get('id')}", use_container_width=True):
                 st.session_state["last_report"] = report
                 st.session_state["dashboard_view"] = "report"
+                st.query_params["page"] = "dashboard"
                 st.query_params["view"] = "report"
                 st.rerun()
         with download_col:
@@ -1793,11 +1942,11 @@ def render_previous_reports(history):
             )
         with delete_col:
             if st.button("Delete", key=f"delete_{item.get('id')}", use_container_width=True):
-                updated_history = [h for h in load_report_history() if h.get("id") != item.get("id")]
-                save_report_history(updated_history)
+                delete_report_entry(item.get("id"))
                 if st.session_state.get("last_report") == report:
                     st.session_state.pop("last_report", None)
                     st.session_state["dashboard_view"] = "reports"
+                    st.query_params["page"] = "dashboard"
                     st.query_params["view"] = "reports"
                 st.success("Report deleted.")
                 st.rerun()
@@ -1841,6 +1990,7 @@ def render_report(report):
     with back_col:
         if st.button("← Back to Requirement Forge", use_container_width=True):
             st.session_state["dashboard_view"] = "form"
+            st.query_params["page"] = "dashboard"
             st.query_params["view"] = "form"
             st.rerun()
     with pdf_col:
@@ -2143,6 +2293,8 @@ def main():
     elif query_page == "auth":
         st.session_state["page"] = "auth"
         st.session_state["auth_mode"] = "signup" if query_mode == "signup" else "login"
+    elif query_page == "dashboard":
+        st.session_state["page"] = "dashboard"
 
     if st.session_state["page"] == "auth":
         auth_page()

@@ -8,30 +8,40 @@ from typing import Dict, Any
 from src.rag.retriever import query_supabase
 
 
-# LLM integration (LangChain/OpenAI). Uses OPENAI_API_KEY if present.
-def get_llm():
-    try:
-        from langchain.llms import OpenAI
-    except Exception:
-        return None
-    key = os.getenv('OPENAI_API_KEY')
-    if not key:
-        return None
-    try:
-        # model name: gpt-5-mini (OpenAI-compatible)
-        return OpenAI(temperature=0.2, model_name="gpt-5-mini", openai_api_key=key)
-    except Exception:
-        return None
+def _configured_key(name: str) -> str:
+    value = (os.getenv(name) or "").strip()
+    if not value or value.lower().startswith("your_") or value.lower() in {"your api key", "none", "null"}:
+        return ""
+    return value
 
 
 def call_llm(prompt: str) -> str:
-    llm = get_llm()
-    if not llm:
+    """Return an LLM response, preferring Gemini when GOOGLE_API_KEY is configured."""
+    if os.getenv("DISABLE_LLM", "").lower() in {"1", "true", "yes"}:
         return ""
-    try:
-        return llm(prompt)
-    except Exception:
-        return ""
+    google_key = _configured_key("GOOGLE_API_KEY")
+    if google_key:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+            llm = ChatGoogleGenerativeAI(model=model, temperature=0.25, google_api_key=google_key)
+            response = llm.invoke(prompt)
+            return getattr(response, "content", str(response)) or ""
+        except Exception:
+            pass
+
+    openai_key = _configured_key("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            from langchain_community.llms import OpenAI
+
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            llm = OpenAI(temperature=0.25, model_name=model, openai_api_key=openai_key)
+            return llm(prompt) or ""
+        except Exception:
+            pass
+    return ""
 
 
 def parse_llm_json(raw: str):
@@ -46,6 +56,11 @@ def parse_llm_json(raw: str):
         return json.loads(text)
     except Exception:
         return None
+
+
+def extract_json_object(raw: str) -> Dict[str, Any]:
+    parsed = parse_llm_json(raw)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _safe_join_texts(rows):
@@ -230,6 +245,20 @@ def business_model_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
     profile = _input_profile(inputs)
     stage = inputs.get('business_stage', 'Idea')
     budget = inputs.get('budget', '')
+    prompt = (
+        "Create a real-world business model for this startup. Use the input constraints and market context only; "
+        "avoid generic placeholder wording. Respond as JSON with keys: revenue_model, pricing, budget, stage, segments.\n"
+        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}"
+    )
+    parsed = extract_json_object(call_llm(prompt))
+    if parsed:
+        return {
+            "revenue_model": parsed.get("revenue_model") or "Usage-based subscription with paid pilots",
+            "pricing": parsed.get("pricing") or f"Pilot package for {profile['audience']}",
+            "budget": parsed.get("budget") or budget,
+            "stage": parsed.get("stage") or stage,
+            "segments": parsed.get("segments") or profile["audience"],
+        }
     revenue = "SaaS subscription + paid pilots + implementation support"
     pricing = f"Pilot package for {profile['audience']}, then tiered monthly plans by usage, seats, or managed locations"
     return {"revenue_model": revenue, "pricing": pricing, "budget": budget, "stage": stage, "segments": profile["audience"]}
@@ -237,6 +266,19 @@ def business_model_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
 
 def swot_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
     profile = _input_profile(inputs)
+    prompt = (
+        "Build a grounded SWOT analysis for this startup idea. Use the retrieved context and user inputs. "
+        "Respond as JSON with array keys: strengths, weaknesses, opportunities, threats.\n"
+        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}\nContext: {retrieved_text[:2500]}"
+    )
+    parsed = extract_json_object(call_llm(prompt))
+    if parsed:
+        return {
+            "strengths": parsed.get("strengths") or [],
+            "weaknesses": parsed.get("weaknesses") or [],
+            "opportunities": parsed.get("opportunities") or [],
+            "threats": parsed.get("threats") or [],
+        }
     strengths = [
         f"Focused solution for {profile['audience']} in {profile['region']}",
         "AI-first automation can reduce manual workload and response time",
@@ -259,6 +301,23 @@ def swot_agent(inputs: Dict[str, Any], retrieved_text: str) -> Dict[str, Any]:
 
 def validation_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
     profile = _input_profile(inputs)
+    prompt = (
+        "Score this startup idea from 1 to 10 using the user's market, audience, stage, and budget. "
+        "Respond as JSON with numeric keys: innovation, market_demand, feasibility, scalability, overall, "
+        "and a short rationale key.\n"
+        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}"
+    )
+    parsed = extract_json_object(call_llm(prompt))
+    if parsed:
+        scores = {
+            "innovation": parsed.get("innovation"),
+            "market_demand": parsed.get("market_demand"),
+            "feasibility": parsed.get("feasibility"),
+            "scalability": parsed.get("scalability"),
+        }
+        numeric_scores = [float(v) for v in scores.values() if isinstance(v, (int, float))]
+        overall = parsed.get("overall") or (round(sum(numeric_scores) / len(numeric_scores), 2) if numeric_scores else "N/A")
+        return {**scores, "scores": scores, "overall": overall, "rationale": parsed.get("rationale")}
     problem_len = len(profile["problem"])
     audience_bonus = 1 if profile["audience"] != "target customers" else 0
     region_bonus = 1 if profile["region"] != "the selected market" else 0
@@ -270,6 +329,72 @@ def validation_agent(inputs: Dict[str, Any]) -> Dict[str, Any]:
     }
     overall = round(sum(scores.values()) / len(scores), 2)
     return {**scores, "scores": scores, "overall": overall}
+
+
+def _budget_number(value):
+    try:
+        cleaned = re.sub(r"[^\d.]", "", str(value or ""))
+        return float(cleaned) if cleaned else None
+    except Exception:
+        return None
+
+
+def strategic_plan_agent(inputs: Dict[str, Any], retrieved_text: str, agents_output: Dict[str, Any]) -> Dict[str, Any]:
+    budget_total = _budget_number(inputs.get("budget"))
+    prompt = (
+        "Generate implementation details for a startup report using real-world assumptions from the inputs and context. "
+        "Avoid fixed boilerplate. Respond as JSON exactly with keys: mvp_features (array of 5-7 specific features), "
+        "implementation_roadmap (object with phase_1..phase_4 practical milestones), "
+        "estimated_budget (object with budget categories and numeric USD values when budget is known), "
+        "future_enhancements (array of 3-5 specific enhancements).\n"
+        f"Inputs: {json.dumps(inputs, ensure_ascii=False)}\n"
+        f"Generated analysis: {json.dumps(agents_output, ensure_ascii=False)[:2500]}\n"
+        f"Retrieved context: {retrieved_text[:2500]}"
+    )
+    parsed = extract_json_object(call_llm(prompt))
+    if parsed:
+        return {
+            "mvp_features": parsed.get("mvp_features") or [],
+            "implementation_roadmap": parsed.get("implementation_roadmap") or {},
+            "estimated_budget": parsed.get("estimated_budget") or {},
+            "future_enhancements": parsed.get("future_enhancements") or [],
+        }
+
+    profile = _input_profile(inputs)
+    stage = profile["stage"].lower()
+    mvp = [
+        f"Intake workflow tailored to {profile['audience']}",
+        f"Domain knowledge search for {profile['domain']} decisions",
+        f"Prioritization engine for the core problem: {profile['problem'][:90]}",
+        f"Operator dashboard for {profile['region']} pilot tracking",
+        "Feedback capture tied to measurable customer outcomes",
+    ]
+    roadmap = {
+        "phase_1": f"Validate {profile['audience']} workflows and success metrics in {profile['region']} (2-3 weeks)",
+        "phase_2": f"Build a {stage} MVP around the highest-friction workflow (4-8 weeks)",
+        "phase_3": "Run paid or design-partner pilots and compare outcomes against baseline operations (4-6 weeks)",
+        "phase_4": "Package repeatable onboarding, support, and analytics for launch expansion",
+    }
+    if budget_total:
+        est = {
+            "product_engineering": round(budget_total * 0.45, 2),
+            "data_and_ai_infrastructure": round(budget_total * 0.2, 2),
+            "customer_discovery_and_pilots": round(budget_total * 0.15, 2),
+            "go_to_market": round(budget_total * 0.12, 2),
+            "operations_and_compliance": round(budget_total * 0.08, 2),
+        }
+    else:
+        est = {
+            "product_engineering": "Estimate after MVP scope lock",
+            "data_and_ai_infrastructure": "Estimate after model and data volume selection",
+            "go_to_market": "Estimate after pilot channel selection",
+        }
+    future = [
+        f"Regional localization for {profile['region']} customer segments",
+        "Partner integrations with the systems customers already use",
+        "Outcome analytics that prove time, cost, or quality improvement",
+    ]
+    return {"mvp_features": mvp, "implementation_roadmap": roadmap, "estimated_budget": est, "future_enhancements": future}
 
 
 def report_generator(inputs: Dict[str, Any], agents_output: Dict[str, Any], retrieved_rows) -> Dict[str, Any]:
@@ -308,41 +433,9 @@ def orchestrate_startup(inputs: Dict[str, Any]) -> Dict[str, Any]:
     agents_output['validation'] = validation_agent(inputs)
 
     final = report_generator(inputs, agents_output, retrieved)
-    # add simple MVP features, roadmap and budget heuristics
-    # MVP features: login, dashboard, core AI, analytics, notifications
-    mvp = [
-        "User authentication (mobile + web)",
-        "Dashboard for recommendations",
-        "Core AI recommendation / prediction module",
-        "Basic analytics and reporting",
-        "Notifications (email / SMS / WhatsApp)"
-    ]
-    roadmap = {
-        "phase_1": "Research & prototyping (2-4 weeks)",
-        "phase_2": "MVP development (6-10 weeks)",
-        "phase_3": "Pilot with early customers (4-8 weeks)",
-        "phase_4": "Launch & iterate (ongoing)"
-    }
-    # simple budget split
-    budget_total = inputs.get('budget') or "TBD"
-    try:
-        # try parse numeric value if possible
-        b = str(budget_total).replace('$','').replace(',','').strip()
-        bnum = float(b) if b else None
-    except Exception:
-        bnum = None
-    if bnum:
-        est = {
-            "development": round(bnum * 0.5, 2),
-            "cloud": round(bnum * 0.2, 2),
-            "marketing": round(bnum * 0.15, 2),
-            "operations": round(bnum * 0.15, 2),
-        }
-    else:
-        est = {"development": "TBD", "cloud": "TBD", "marketing": "TBD", "operations": "TBD"}
-
-    final["mvp_features"] = mvp
-    final["implementation_roadmap"] = roadmap
-    final["estimated_budget"] = est
-    final["future_enhancements"] = ["Multilingual support", "Offline-first mobile features", "Integrations with local platforms"]
+    plan = strategic_plan_agent(inputs, retrieved_text, agents_output)
+    final["mvp_features"] = plan.get("mvp_features", [])
+    final["implementation_roadmap"] = plan.get("implementation_roadmap", {})
+    final["estimated_budget"] = plan.get("estimated_budget", {})
+    final["future_enhancements"] = plan.get("future_enhancements", [])
     return final

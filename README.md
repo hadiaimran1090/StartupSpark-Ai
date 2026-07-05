@@ -50,7 +50,14 @@ SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 SUPABASE_BUCKET_NAME=startupspark-docs
 ```
 
-4. Run the app.
+4. Run the Supabase SQL setup files in your Supabase SQL editor.
+
+```text
+sql/supabase_startup_knowledge.sql
+sql/supabase_startup_reports.sql
+```
+
+5. Run the app.
 
 ```powershell
 streamlit run app.py
@@ -64,6 +71,7 @@ streamlit run app.py
 - Workflow stub in `src/workflow/graph.py`
 - RAG helper stubs in `src/rag/`
 - Report saving utility in `src/utils/report.py`
+- Per-user report storage in Supabase via `startup_reports`
 
 ## Next implementation steps
 
@@ -71,5 +79,4 @@ streamlit run app.py
 2. Split documents into chunks
 3. Create embeddings and store them in Supabase
 4. Connect LangGraph nodes to the four agents
-5. Replace placeholder logic with Gemini powered prompts
-
+5. Expand prompts and evaluation tests for Gemini-powered report generation
