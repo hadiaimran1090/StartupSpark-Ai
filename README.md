@@ -165,6 +165,13 @@ Rendered as an interactive bento-grid report + exportable PDF/JSON
 If the Retrieval Agent finds no usable context, or both LLM providers fail, the pipeline raises a clear error instead of silently generating a fake/hardcoded report — so you always know whether you're looking at a grounded result.
 
 ---
+## 🎬 Demo
+
+<p align="center">
+  <a href="https://drive.google.com/open?id=1fdDqenMUD2qrhoo9cS2XkCPRNRUzwIVy&usp=drive_fs" target="_blank">
+    <img src="https://img.shields.io/badge/▶_Watch_App_Demo-2563EB?style=for-the-badge&logo=google-drive&logoColor=white" alt="StartupSpark_AI Demo" height="45"/>
+  </a>
+</p>
 
 ## 🌟 Support & Contribution
 
