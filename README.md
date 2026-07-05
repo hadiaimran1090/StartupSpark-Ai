@@ -169,7 +169,7 @@ If the Retrieval Agent finds no usable context, or both LLM providers fail, the 
 
 <p align="center">
   <a href="https://drive.google.com/open?id=1fdDqenMUD2qrhoo9cS2XkCPRNRUzwIVy&usp=drive_fs" target="_blank">
-    <img src="https://img.shields.io/badge/▶_Watch_App_Demo-2563EB?style=for-the-badge&logo=google-drive&logoColor=white" alt="StartupSpark_AI Demo" height="45"/>
+    <img src="https://img.shields.io/badge/▶_Watch_Demo-2563EB?style=for-the-badge&logo=google-drive&logoColor=white" alt="StartupSpark_AI Demo" height="45"/>
   </a>
 </p>
 
