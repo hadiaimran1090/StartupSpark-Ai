@@ -92,8 +92,6 @@
 
    ENABLE_EXTERNAL_SEARCH=1
    ```
-   > ⚠️ Never commit your `.env` file or share your service-role key — it bypasses all Supabase row-level security.
-
 4. **Set Up Supabase**
    - Enable Email Auth in your Supabase project.
    - Run `sql/supabase_startup_reports.sql` in the Supabase SQL editor to create the reports table.
